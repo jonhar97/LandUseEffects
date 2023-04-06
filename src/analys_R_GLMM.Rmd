@@ -1,0 +1,2583 @@
+---
+title: "Reservvatten GLMM"
+author: "Jon"
+date: "January 11, 2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = normalizePath("C:/Users/joah/OneDrive - Skogforsk/Documents/Projekt/Old/Reservvatten/LandUse/"))
+library(rstan)
+options(mc.cores = parallel::detectCores()) # For execution on a local, multicore CPU with excess RAM
+rstan_options(auto_write = TRUE) # To avoid recompilation of unchanged Stan programs
+library(ggplot2)
+library(bayesplot)
+library(reshape2)
+library(dplyr)
+library(rstanarm)
+library(tidyverse)
+library(phyloseq)
+#install.packages("tidytext")
+library(tidytext)
+require(factoextra)
+setwd("C:/Users/joah/OneDrive - Skogforsk/Documents/Projekt/Old/Reservvatten/LandUse/")
+```
+
+
+```{r, include=FALSE}
+####################### functions ######################
+find_significance <- function(aj_summary){
+  aj_tmp <- aj_summary
+  i1 <- which(aj_summary[,4] > 0)
+  i2 <- which(aj_summary[,5] < 0)
+  aj_tmp <- aj_tmp[c(i1,i2),]
+
+  return(aj_tmp)  
+}
+plot_coef <- function(beta,textstr,ylab=1){
+  CIlow <-beta[,4]
+  CIhigh <- beta[,5]
+p <- ggplot(beta,aes(x=Variable,y = mean)) + geom_point(size = 0.1) + geom_pointrange(aes(ymin = CIlow,ymax = CIhigh),color = ifelse(CIlow < 0 & CIhigh > 0, "red","darkblue")) + coord_flip() + theme_bw()  + xlab("Variable") + ylab("Estimate") + geom_hline(yintercept=0,lty = 2) + ggtitle(textstr); p
+  if(ylab==0){
+   p <- p + theme(axis.text.y = element_blank())
+  }
+
+  return(p)
+
+}
+#' Get Triangle of the Correlation Matrix
+#'
+#' Gets a triangle (lower or upper) of a correlation matrix.
+#' 
+#' @param cor.mat Correlation matrix.
+#' @param tri.type Retrieve values below or above the matrix. If 'none' is 
+#'   specified, then the same input matrix is returned.
+#' @return matrix with values above or below the diagonal depending on the 
+#'   tri.type.
+#' @export
+get_lower_upper_tri <- function(cor.mat, tri.type = c("none", "lower", 
+                                                      "upper")) {
+
+  tri.type <- match.arg(tri.type)
+  
+  if (tri.type == "upper") {
+    cor.mat[upper.tri(cor.mat)] <- NA
+  } else if (tri.type == "lower") {
+    cor.mat[lower.tri(cor.mat)]<- NA
+  }
+
+  cor.mat
+}
+```
+
+## Read data
+
+```{r data}
+load(file = "otu_table_psno.rds")
+load(file = "tax_table_psno.rds")
+meta <- read_tsv(file = "metadata.tsv")
+# rename otus
+rn <- rownames(otu_full)
+nn <- paste("asv_",seq(1,nrow(otu_full)),sep="")# new name
+df <-cbind(rn,nn)
+colnames(df) <- c("Original","Recoded")
+write.table(file = "key_recoded_asvs.txt",x = df,quote=F,sep="\t")
+rownames(otu_full) <- nn
+rownames(tax_full) <- nn
+```
+
+## Filter ASVs
+Top abundant 100 ASVs selected
+```{r filtration}
+cat(sprintf("Dimension prior to filtration: %d x %d\n",dim(otu_full)[1],dim(otu_full)[2]))
+######## remove low abundant asvs ########
+min_reads <- 1500
+asvs1 <- otu_full[which(rowSums(otu_full)>min_reads),]
+cat(sprintf("Dimension after removing asvs less abundant than %d reads: %d x %d\n",min_reads,dim(asvs1)[1],dim(asvs1)[2]))
+rm(asvs1)
+######## keep top abundant asvs ############
+top_limit <- 100
+asvs2 <- otu_full[order(rowSums(otu_full),decreasing = TRUE)[1:top_limit],]
+tax2 <- tax_full[order(rowSums(otu_full),decreasing = TRUE)[1:top_limit],]
+tax3 <- tax_full[order(rowSums(otu_full),decreasing = TRUE),]
+cat(sprintf("Dimension after keeping top %d of the asvs: %d x %d\n",top_limit,dim(asvs2)[1],dim(asvs2)[2]))
+```
+
+## Question 1 effect of land use in inflows
+Only inflow samples, 115 samples in total
+```{r q1}
+# filter data
+meta.q1 <- meta[which(meta$Type=='Point'),]
+common <- intersect(colnames(asvs2), meta.q1$SampleID)
+asvs2.q1<-asvs2[,common]
+rownames(meta.q1) <- meta.q1$SampleID
+meta.q1 <- meta.q1[common,]
+cat(sprintf("Dimension after removing lake samples: %d x %d\n",dim(asvs2.q1)[1],dim(asvs2.q1)[2]))
+# define numerical constants
+meta.q1$Lake <- as.factor(meta.q1$Lake)
+meta.q1$SamplePoint <- as.factor(meta.q1$SamplePoint)
+meta.q1$Run <- as.factor(meta.q1$Run)
+meta.q1$Surround <- as.factor(meta.q1$Surround)
+meta.q1$UpstreamBuild <- as.factor(meta.q1$UpstreamBuild)
+meta.q1$UpstreamFarm <- as.factor(meta.q1$UpstreamFarm)
+meta.q1$`Size(stream)` <- as.factor(meta.q1$`Size(stream)`)
+L <- nlevels(meta.q1$Lake)
+N <- ncol(asvs2.q1)
+M <- nlevels(meta.q1$SamplePoint)
+# define predictors
+nseq <- colSums(asvs2.q1)
+t <- rep(1,nrow(meta.q1))
+t[grep('18',meta.q1$SampleID)] <- 2
+t[grep('omg3',meta.q1$SampleID)] <- 3
+t[grep('omg4',meta.q1$SampleID)] <- 4
+ye <- as.numeric(meta.q1$Run)
+su <- as.numeric(meta.q1$Surround)
+bu <- as.numeric(meta.q1$UpstreamBuild)
+fa <- as.numeric(meta.q1$UpstreamFarm)
+si <- as.numeric(meta.q1$`Size(stream)`)
+pa <- as.numeric(meta.q1$UpstreamPast)+1
+# NB! Update
+si[which(is.na(si))] <- 3
+# define which random effect each sample and site is assigned to 
+level2 <- as.numeric(meta.q1$SamplePoint)
+lev3ForLev2 <- rep(1,M)
+lev3ForLev2[grep('Horn',levels(meta.q1$SamplePoint))] <- 2
+lev3ForLev2[grep('Okl',levels(meta.q1$SamplePoint))] <- 3 
+lev3ForLev2[grep('Skar',levels(meta.q1$SamplePoint))] <- 4
+lev3ForLev2[grep('Svar',levels(meta.q1$SamplePoint))] <- 5
+# outcome
+y <- asvs2.q1
+# add indicators
+y <- rbind(y,t(round(meta.q1[,seq(12,15)])))
+K <- nrow(y)
+mCo <- round(mean(meta.q1$Coliforms,na.rm = TRUE))
+mEc <- round(mean(meta.q1$`E. coli`,na.rm = TRUE))
+mEn <- round(mean(meta.q1$Entero,na.rm = TRUE))
+mCp <- round(mean(meta.q1$`C. perf`,na.rm = TRUE))
+# add means where values aree missing in y
+# can be imputed more cleverly
+y[(top_limit+1), which(is.na(y[(top_limit+1),]==TRUE))] <- mCo 
+y[(top_limit+2), which(is.na(y[(top_limit+2),]==TRUE))] <- mEc
+y[(top_limit+3), which(is.na(y[(top_limit+3),]==TRUE))] <- mEn 
+y[(top_limit+4), which(is.na(y[(top_limit+4),]==TRUE))] <- mCp
+# save dependent variable names
+vn <- rownames(y)
+su[which(su==3)]<-2 # only two factor levels
+data <- list(L=L,N=N,K=K,M=M,y=y,nseq=nseq,t=t,ye=ye,su=su,bu=bu,fa=fa,si=si,pa=pa,lev3ForLev2=lev3ForLev2,level2=level2)
+cat(sprintf("Final dimension: %d x %d\n",dim(y)[1],dim(y)[2]))
+```
+
+
+## stan model 1 ASV data
+GLMM
+```{stan output.var="mod.asvs"}
+data {
+
+  int L;	// number of lakes (i.e. no of 3-level groups)
+  int N;	// number of samples	
+  int K;	// number of measured outcomes
+  int M;	// number of 2st level factor combinations (i.e. sites at each lake system)
+  // outcome
+  int<lower=0> y[K,N]; 	// abundance matrix of outcome variables
+  // offset
+  int nseq[N];	// sequence depth of samples for normalizing abundance counts
+  // predictors
+  int<lower=1, upper=4> t[N];	// timepoint or sampling round effect (t = 1,2,3,4)
+  int<lower=1, upper=2> ye[N];	// year or batch effect (0 or 1)
+  int<lower=1, upper=2> su[N]; // surrounding field/forest
+  int<lower=1, upper=2> bu[N]; // effect of buildings on outcome 
+  int<lower=1, upper=2> fa[N]; // effect of farms on outcome 
+  int<lower=1, upper=2> si[N]; // size of stream (small/medium/large)
+  int<lower=1, upper=2> pa[N]; // effect of pasture on outcome 
+  int<lower=1, upper=L> lev3ForLev2[M];	// lake system, level 3 in hierarchy
+  int<lower=1, upper=M> level2[N];	// sampling point, level 2 in hierarchy NB! Check max number of sampling points
+
+} 
+parameters {
+    
+  //vector[K] b[J]; 
+  // Group level coefficient matrix NB check dimension!
+  matrix[K,3] beta01;
+  matrix[K,1] beta02;
+  matrix[K,1] beta03;
+  matrix[K,1] beta04;
+  matrix[K,1] beta05;
+  matrix[K,1] beta06;
+  matrix[K,1] beta07;
+  vector[K] bs;	// coefficient for sequence depth covariate o be used as an offset in model
+
+  // varying intercepts 
+  vector[K] a;	// mean across sites
+  // residuals
+  vector[K] u_j[L]; 	// lake specific residual
+  vector[K] u_jk[M];	// lake x site residual
+//  vector[K] u_jkl[N];   // outcome specific residual, K for each of N samples
+  real<lower=0> phi[K]; // neg. binomial dispersion parameter, K dim, one per feature
+
+  real<lower=0.001> sigma_g[K]; // std dev of random intercept for lake
+  real<lower=0.001> sigma_t[K]; // std dev of random intercept for lake x site
+
+}
+transformed parameters {
+  matrix[K,4] beta1;
+  matrix[K,2] beta2;
+  matrix[K,2] beta3;
+  matrix[K,2] beta4;
+  matrix[K,2] beta5;
+  matrix[K,2] beta6;
+  matrix[K,2] beta7;
+  matrix[K,N] mu; // Individual mean for each response
+  vector[K] a_j[L]; 	// group coefficient for intercept of each site
+  vector[K] a_jk[M]; 	// group coefficient for intercept of each location x site
+  real logseq[N];
+
+  logseq = log(nseq);
+
+  // Varying intercepts definition
+  // Level-3 (L level-3 random intercepts)
+  for (j in 1:L) {
+    a_j[j] = a + u_j[j]; // lake system effect
+  }
+  // Level-2 (M level-2 random intercepts)
+  for (k in 1:M) {
+    a_jk[k] = a_j[lev3ForLev2[k]] + u_jk[k]; // lake x site effect
+  }
+  // sum-to-zero hard constraint on group level predictors
+  for (i in 1:K){
+    for (j in 1:3){
+      beta1[i,j] = beta01[i,j];
+    }
+    beta1[i,4] = -sum(beta01[i,]);
+    beta2[i,1] = beta02[i,1];
+    beta2[i,2] = -beta02[i,1];
+    beta3[i,1] = beta03[i,1];
+    beta3[i,2] = -beta03[i,1];
+    beta4[i,1] = beta04[i,1];
+    beta4[i,2] = -beta04[i,1];
+    beta5[i,1] = beta05[i,1];
+    beta5[i,2] = -beta05[i,1];
+    beta6[i,1] = beta06[i,1];
+    beta6[i,2] = -beta06[i,1];
+    beta7[i,1] = beta07[i,1];
+    beta7[i,2] = -beta07[i,1];
+  }
+  // Individual mean at the replicate level
+  for (i in 1:K) {
+    for (j in 1:N){
+      mu[i,j] = a_jk[level2[j],i] + beta1[i,t[j]] + beta2[i,ye[j]] + beta3[i,su[j]] + beta4[i,bu[j]] + beta5[i,fa[j]] + beta6[i,si[j]] + beta7[i,pa[j]]; // NB! Check for three level group predictors
+    }
+  }
+}
+model {
+
+  // priors
+  for (j in 1:L)
+    u_j[j] ~ normal(0,sigma_g); // residual for site
+  for (k in 1:M)
+    u_jk[k] ~ normal(0,sigma_t); // residual for site x location
+    
+    // prior assigned to regression coefficients
+  for (j in 1:K ){
+    for (l in 1:3)
+      beta01[j,l] ~ normal(0,10); // vague prior
+    beta02[j,1] ~ normal(0,10); // vague prior
+    beta03[j,1] ~ normal(0,10); // vague prior
+    beta04[j,1] ~ normal(0,10); // vague prior
+    beta05[j,1] ~ normal(0,10); // vague prior
+    beta07[j,1] ~ normal(0,10); // vague prior
+    beta06[j,1] ~ normal(0,10);
+    bs[j] ~ normal(0,10); // vague prior
+  }
+
+  for ( j in 1:K ) phi[j] ~ cauchy(0, 3); 	// dispersion parameter, 18 dim
+
+  // likelihoods
+  for ( i in 1:K){
+    for ( j in 1:N ) {
+      y[i,j] ~ neg_binomial_2_log(mu[i,j] + bs[i] * logseq[j],phi[i]); 
+    }
+  }
+}
+
+
+```
+
+## Run Stan model 1, ASV data
+
+```{r}
+n_chains <- 8 # number of parallel chains in HMC inference
+fit <- sampling(
+  mod.asvs, # stan model no1
+  data=data,
+  iter = 2000, 
+  warmup = 1000,
+  chains = n_chains
+  )
+print(head(summary(fit)$summary))
+
+spath <- "Save/"
+saveRDS(fit, paste(spath,"model_asvs_indicator_step1.rds",sep=""))
+# if analysis alread saved
+fit <- readRDS("Savemodel_asvs_indicator_step1.rds")
+```
+
+## Check output from Stan analysis (i.e. assess posterior statistics)
+
+```{r posterior statistics asvs part 1}
+aj_summary <- summary(fit, pars = c("beta3","beta4","beta5","beta7"), probs = c(0.025, 0.975))$summary # 
+#cat(sprintf('a_j parameter (to assess effect of contamination on ASVs):\n'))
+#print(aj_summary)
+
+sig_par <- find_significance(aj_summary)
+cat(sprintf('significant inferred regression coefficients (to assess effect of contamination on ASVs):\n'))
+print(sig_par)
+```
+
+## Plot results
+
+```{r posterior plots of ASV data analysis}
+beta.tmp <- aj_summary[grep(',2',rownames(aj_summary)),]
+beta.3 <- as.data.frame(beta.tmp[grep('beta3',rownames(beta.tmp)),])
+beta.3$Variable <- vn
+beta.3$Predictor <- "Fields"
+beta.4 <- as.data.frame(beta.tmp[grep('beta4',rownames(beta.tmp)),])
+beta.4$Variable <- vn
+beta.4$Predictor <- "Buildings"
+beta.5 <- as.data.frame(beta.tmp[grep('beta5',rownames(beta.tmp)),])
+beta.5$Variable <- vn
+beta.5$Predictor <- "Farms"
+beta.7 <- as.data.frame(beta.tmp[grep('beta7',rownames(beta.tmp)),])
+beta.7$Variable <- vn
+beta.7$Predictor <- "Pasture"
+
+
+pb3 <- plot_coef(beta.3,"Fields",ylab=0)
+pb4 <- plot_coef(beta.4,"Buildings",ylab=0)
+pb5 <- plot_coef(beta.5,"Farms",ylab=0)
+pb7 <- plot_coef(beta.7,"Pasture",ylab=0)
+beta.tot <- rbind(beta.3,beta.4,beta.5,beta.7)
+
+ggsave(filename = "asvs_field_effect.png", plot = pb3)
+ggsave(filename = "asvs_building_effect.png", plot = pb4)
+ggsave(filename = "asvs_farm_effect.png", plot = pb5)
+ggsave(filename = "asvs_pasture_effect.png", plot = pb7)
+
+########## joint figure
+#beta.tot %>% arrange(beta.tot, desc(mean)) 
+CIlow <-beta.3[,4]
+CIhigh <- beta.3[,5]
+#beta.tot %>% arrange(beta.tot, mean)
+#p <- 
+  
+  
+  beta.3 %>%
+  arrange(mean) %>%    # First sort by val. This sort the dataframe but NOT the factor levels
+  mutate(name=factor(Variable, levels=Variable)) %>%   # This trick update the factor levels
+  ggplot(aes(x=Variable,y = mean)) + geom_point(size = 0.1) + geom_pointrange(aes(ymin = CIlow,ymax = CIhigh),color = ifelse(CIlow < 0 & CIhigh > 0, "red","darkblue")) + coord_flip() + theme_bw()  + xlab("Variable") + ylab("Estimate") + geom_hline(yintercept=0,lty = 2) + 
+  theme(axis.text.y = element_blank())
+
+  CIlow <-beta.tot[,4]
+CIhigh <- beta.tot[,5]
+  p <- beta.tot %>%
+  group_by(Predictor) %>%
+  top_n(-10) %>%
+  ungroup() %>%
+  mutate(Predictor=as.factor(Predictor),
+         Variable=reorder_within(Variable,mean, Predictor)) %>%
+  ggplot(aes(x=Variable,y=mean)) +
+  geom_point(size = 0.1) +
+  geom_pointrange(aes(ymin = CIlow,ymax = CIhigh),color = ifelse(CIlow < 0 & CIhigh > 0, "red","darkblue")) +
+  facet_wrap(~Predictor, scales="free_y")+
+  coord_flip() +
+  theme_bw() +
+  xlab("Variable") +
+  ylab("Estimate") +
+  scale_x_reordered() +
+  geom_hline(yintercept=0,lty = 2) + 
+  scale_y_continuous(expand = c(0,0)) + 
+  theme(axis.text.y = element_blank()); p
+ggsave(filename = "Figures/asvs_joint_predictor_effect_ordered.png", plot = p)
+
+
+## adding taxonomic info ##
+tax2 <- as.data.frame(tax2)
+tax2$Variable = rownames(tax2)
+beta.tax <- merge(beta.tot,tax2,by="Variable") # merge taxonomy and coefficient estimates
+sig.beta.tax <- beta.tax %>%
+  filter(`2.5%` > 0 | `97.5%` < 0)
+
+CIlow <-sig.beta.tax[,5]
+CIhigh <- sig.beta.tax[,6]
+  p2 <- sig.beta.tax %>%
+  group_by(Predictor) %>%
+  #top_n(-10) %>%
+  ungroup() %>%
+  mutate(Predictor=as.factor(Predictor),
+         Variable=reorder_within(Variable,mean, Predictor)) %>%
+  ggplot(aes(x=Variable,y=mean,color=Genus)) + # ,color=Phylum sig.beta.tax, 
+  geom_point(size = 0.1) +
+  geom_pointrange(aes(ymin = CIlow,ymax = CIhigh)) +
+  facet_wrap(~Predictor, scales="free_y")+
+  coord_flip() +
+  theme_bw() +
+  xlab("Variable") +
+  ylab("Estimate") +
+  scale_x_reordered() +
+  geom_hline(yintercept=0,lty = 2) + 
+  scale_y_continuous(expand = c(0,0)) + 
+  theme(axis.text.y = element_blank()); p2
+ggsave(filename = "asvs_joint_predictor_effect_significant_with_genus_ordered.png", plot = p2)
+
+table.beta <- sig.beta.tax %>%
+  select(-c(se_mean,n_eff,Rhat)) %>%
+   group_by(Predictor) %>%
+   arrange(Predictor, desc(mean)) %>% 
+  mutate_if(is.numeric, round, digits = 2)
+write.table(table.beta,file = "Table_asvs_sign2.txt",quote = F,sep="\t",row.names = F)
+
+####### Barplot of associated ASVs in different habitats ########
+```
+
+## Select dataset for chemical signatures
+
+
+```{r chemdata}
+# Check distributions
+# check distribution of each variable
+hist(meta$Coliforms,nclass=20)
+meta$logColiforms <- log(meta$Coliforms+0.001) # use log-transform
+hist(meta$`E. coli`,nclass=20)
+meta$logEcoli<-log(meta$`E. coli`+0.3)
+hist(meta$Entero,nclass=20)
+meta$logEntero <- log(meta$Entero+0.1)
+hist(meta$`C. perf`,nclass=20)
+meta$logCperf <- log(meta$`C. perf`+0.8)
+hist(meta$Turbidity,nclass=20)
+meta$logTurbidity <- log(meta$Turbidity)
+hist(meta$ColorVal,nclass=20)
+meta$logColorVal <- log(meta$ColorVal)
+hist(meta$pH,nclass=20)
+meta$exppH <- exp(meta$pH)
+hist(meta$Alkalinity,nclass=20)
+meta$logAlkalinity <- log(meta$Alkalinity+0.001)
+hist(meta$CODMn,nclass=20)
+meta$logCODMn <- log(meta$CODMn)
+hist(meta$Conductivity,nclass=20)
+meta$logConductivity <- log(meta$Conductivity)
+hist(meta$TotalHardness,nclass=20)
+meta$logTotalHardness <- log(meta$TotalHardness)
+hist(meta$Cloride,nclass=20) # normally distributed!!
+hist(meta$Sulfate,nclass=20)
+meta$logSulfate <- log(meta$Sulfate)
+hist(meta$Ammonium,nclass=20)
+meta$logAmmonium <-log(meta$Ammonium+0.001)
+hist(meta$Ammonium_nitrogen,nclass=20)
+meta$logAmmonium_nitrogen <-log(meta$Ammonium_nitrogen+0.001)
+hist(meta$Nitrate,nclass=20)
+meta$logNitrate <-log(meta$Nitrate+0.001)
+hist(meta$Nitrate_nitrogen,nclass=20)
+meta$logNitrate_nitrogen <-log(meta$Nitrate_nitrogen+0.001)
+hist(meta$Sodium,nclass=20)
+hist(meta$Potassium,nclass=20)
+hist(meta$Calcium,nclass=20)
+meta$logCalcium <-log(meta$Calcium)
+hist(meta$Iron,nclass=20)
+meta$logIron <-log(meta$Iron)
+hist(meta$Magnesium,nclass=20)
+meta$logMagnesium <-log(meta$Magnesium)
+hist(meta$Manganese,nclass=20)
+meta$logManganese <-log(meta$Manganese)
+hist(meta$Aluminium,nclass=20)
+meta$logAluminium <-log(meta$Aluminium)
+hist(meta$Copper,nclass=20)
+meta$logCopper <-log(meta$Copper+0.001)
+# remove missing data
+meta.upd <- meta[-which(is.na(meta$Iron)),]
+cat(sprintf('Number of samples with chemical records %d\n',nrow(meta.upd)))
+# check only point samples
+meta.upd2 <- meta.upd[which(meta.upd$Type=='Point'),]
+cat(sprintf('Number of inflow samples with chemical records %d\n',nrow(meta.upd2)))
+
+# define numerical constants
+meta.upd2$Lake <- as.factor(meta.upd2$Lake)
+meta.upd2$SamplePoint <- as.factor(meta.upd2$SamplePoint)
+meta.upd2$Run <- as.factor(meta.upd2$Run)
+meta.upd2$Surround <- as.factor(meta.upd2$Surround)
+meta.upd2$UpstreamBuild <- as.factor(meta.upd2$UpstreamBuild)
+meta.upd2$UpstreamFarm <- as.factor(meta.upd2$UpstreamFarm)
+meta.upd2$`Size(stream)` <- as.factor(meta.upd2$`Size(stream)`)
+meta.upd2$UpstreamPast <- as.factor(meta.upd2$UpstreamPast)
+L <- nlevels(meta.upd2$Lake)
+N <- nrow(meta.upd2)
+M <- nlevels(meta.upd2$SamplePoint)
+# define predictors
+t <- rep(1,nrow(meta.upd2))
+t[grep('18',meta.upd2$SampleID)] <- 2
+t[grep('omg3',meta.upd2$SampleID)] <- 3
+t[grep('omg4',meta.upd2$SampleID)] <- 4
+ye <- as.numeric(meta.upd2$Run)
+su <- as.numeric(meta.upd2$Surround)
+bu <- as.numeric(meta.upd2$UpstreamBuild)
+fa <- as.numeric(meta.upd2$UpstreamFarm)
+si <- as.numeric(meta.upd2$`Size(stream)`)
+pa <- as.numeric(meta.upd2$UpstreamPast)
+# NB! Update
+si[which(is.na(si))] <- 3
+# define which random effect each sample and site is assigned to 
+level2 <- as.numeric(meta.upd2$SamplePoint)
+lev3ForLev2 <- rep(1,M)
+lev3ForLev2[grep('Horn',levels(meta.upd2$SamplePoint))] <- 2
+lev3ForLev2[grep('Okl',levels(meta.upd2$SamplePoint))] <- 3 
+lev3ForLev2[grep('Skar',levels(meta.upd2$SamplePoint))] <- 4
+lev3ForLev2[grep('Svar',levels(meta.upd2$SamplePoint))] <- 5
+# outcome
+y <- t(meta.upd2[,c(34,40,41,seq(52,69))]) # NB! select columns
+# save dependent variable names
+vn <- colnames(meta.upd2[,c(34,40,41,seq(52,69))])
+# scale outcome to mean zero and unit variance
+y <- t(scale(t(y)))
+cat(sprintf('Dim: %d x %d\n',dim(y)[1],dim(y)[2]))
+K <- nrow(y)
+su[which(su==3)]<-2
+data <- list(L=L,N=N,K=K,M=M,y=y,t=t,ye=ye,su=su,bu=bu,fa=fa,si=si,pa=pa,lev3ForLev2=lev3ForLev2,level2=level2)
+
+```
+
+
+## Plot correlations of chemical signatures
+
+```{r}
+
+cor.mat <- cor(t(y))
+colnames(cor.mat) <- rownames(cor.mat) <- c("Cloride", "Sodium","Potassium","Turbidity","ColorVal","pH","Alkalinity", "CODMn","Conductivity",  "TotalHardness", "Sulfate","Ammonium", "Ammonium_nitrogen", "Nitrate","Nitrate_nitrogen","Calcium", "Iron", "Magnesium", "Manganese", "Aluminium", "Copper")
+upper_tri <- get_lower_upper_tri(cor.mat,tri.type = "upper")
+colnames(upper_tri) <- rownames(upper_tri) <- rownames(y)
+#melted_cormat <- melt(cor.mat)
+melted_cormat <- melt(upper_tri, na.rm = TRUE)
+# Heatmap
+library(ggplot2)
+pcor <- ggplot(data = melted_cormat, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab", 
+   name="Pearson\nCorrelation") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    hjust = 1),axis.title = element_blank(),legend.text = element_text(size = 13),legend.title = element_text(size = 14))+
+ coord_fixed(); pcor
+
+ggsave(filename = "figures/corrplot_chem_data.pdf",pcor)
+ggsave(filename = "figures/corrplot_chem_data.png",pcor)
+## Check pairwise correlations
+index <- which((melted_cormat$value > 0.6 | melted_cormat$value < -0.6) & melted_cormat$value < 0.99)
+print(melted_cormat[index,])
+write.table(x = melted_cormat[index,],file = "Save/high_correlation_chem.txt",quote = F,sep="\t",row.names = F)
+d = 1-dist(cor.mat)
+res.h <- hclust(d = dist(cor.mat))
+groups <- cutree(res.h,k = 10)
+
+dend <- res.h %>%
+  as.dendrogram %>%
+   set("branches_k_color", k=10) %>% set("branches_lwd", 1.2)  
+# plot the dend in usual "base" plotting engine:
+plot(dend)
+# Rectangle dendrogram using ggplot2
+ggd1 <- as.ggdend(dend)
+p <- ggplot(ggd1, horiz = TRUE); p #+                                              # Change color brewer palette
+  #scale_colour_brewer(palette = "Paired"); p 
+ggsave(filename = "figures/dendrogram_chem_data.pdf",p)
+ggsave(filename = "figures/dendrogram_chem_data.png",p)
+obj <- cluster::clusGap(cor.mat,FUN = hcut,K.max = 20)
+fviz_gap_stat(obj)
+```
+## Stan model 2 chemical data
+
+```{stan output.var="mod.chem"}
+data {
+
+  int L;	// number of lakes (i.e. no of 3-level groups)
+  int N;	// number of samples	
+  int K;	// number of measured outcomes
+  int M;	// number of 2st level factor combinations (i.e. sites at each lake system)
+  // outcome
+  real y[K,N]; 	// abundance matrix of outcome variables
+  // predictors
+  int<lower=1, upper=4> t[N];	// timepoint or sampling round effect (t = 1,2,3,4)
+  int<lower=1, upper=2> ye[N];	// year or batch effect (0 or 1)
+  int<lower=1, upper=2> su[N]; // surrounding field/forest
+  int<lower=1, upper=2> bu[N]; // effect of buildings on outcome 
+  int<lower=1, upper=2> fa[N]; // effect of farms on outcome 
+  int<lower=1, upper=3> si[N]; // size of stream (small/medium/large)
+  int<lower=1, upper=2> pa[N]; // effect of pasture on outcome 
+  int<lower=1, upper=L> lev3ForLev2[M];	// lake system, level 3 in hierarchy
+  int<lower=1, upper=M> level2[N];	// sampling point, level 2 in hierarchy NB! Check max number of sampling points
+
+} 
+parameters {
+    
+  //vector[K] b[J]; 
+  // Group level coefficient matrix NB check dimension!
+  matrix[K,3] beta01;
+  matrix[K,1] beta02;
+  matrix[K,1] beta03;
+  matrix[K,1] beta04;
+  matrix[K,1] beta05;
+  matrix[K,2] beta06;
+  matrix[K,1] beta07;
+  vector[K] bs;	// coefficient for sequence depth covariate o be used as an offset in model
+
+  // varying intercepts 
+  vector[K] a;	// mean across sites
+  // residuals
+  vector[K] u_j[L]; 	// lake specific residual
+  vector[K] u_jk[M];	// lake x site residual
+
+  real<lower=0.001> sigma_g[K]; // std dev of random intercept for lake
+  real<lower=0.001> sigma_t[K]; // std dev of random intercept for lake x site
+  real<lower=0.001> sigma_r; // std dev of residual variation
+}
+transformed parameters {
+  matrix[K,4] beta1;
+  matrix[K,2] beta2;
+  matrix[K,2] beta3;
+  matrix[K,2] beta4;
+  matrix[K,2] beta5;
+  matrix[K,3] beta6;
+  matrix[K,2] beta7;
+  matrix[K,N] mu; // Individual mean for each response
+  vector[K] a_j[L]; 	// group coefficient for intercept of each site
+  vector[K] a_jk[M]; 	// group coefficient for intercept of each location x site
+
+  // Varying intercepts definition
+  // Level-3 (L level-3 random intercepts)
+  for (j in 1:L) {
+    a_j[j] = a + u_j[j]; // lake system effect
+  }
+  // Level-2 (M level-2 random intercepts)
+  for (k in 1:M) {
+    a_jk[k] = a_j[lev3ForLev2[k]] + u_jk[k]; // lake x site effect
+  }
+  // sum-to-zero hard constraint on group level predictors
+  for (i in 1:K){
+    for (j in 1:3){
+      beta1[i,j] = beta01[i,j];
+    }
+    beta1[i,4] = -sum(beta01[i,]);
+    for (j in 1:2){
+      beta6[i,j] = beta06[i,j];
+    }
+    beta3[i,1] = beta03[i,1];
+    beta3[i,2] = -beta03[i,1];
+    beta6[i,3] = -sum(beta06[i,]);
+    beta2[i,1] = beta02[i,1];
+    beta2[i,2] = -beta02[i,1];
+    beta4[i,1] = beta04[i,1];
+    beta4[i,2] = -beta04[i,1];
+    beta5[i,1] = beta05[i,1];
+    beta5[i,2] = -beta05[i,1];
+    beta7[i,1] = beta07[i,1];
+    beta7[i,2] = -beta07[i,1];
+  }
+  // Individual mean at the replicate level
+  for (i in 1:K) {
+    for (j in 1:N){
+      mu[i,j] = a_jk[level2[j],i] + beta1[i,t[j]] + beta2[i,ye[j]] + beta3[i,su[j]] + beta4[i,bu[j]] + beta5[i,fa[j]] + beta6[i,si[j]] + beta7[i,pa[j]]; // NB! Check for three level group predictors
+    }
+  }
+}
+model {
+
+  // priors
+  for (j in 1:L)
+    u_j[j] ~ normal(0,sigma_g); // residual for site
+  for (k in 1:M)
+    u_jk[k] ~ normal(0,sigma_t); // residual for site x location
+    
+    // prior assigned to regression coefficients
+  for (j in 1:K ){
+    for (l in 1:3)
+      beta01[j,l] ~ normal(0,10); // vague prior
+    for (l in 1:2){
+      beta06[j,l] ~ normal(0,10); // vague prior
+    }
+    beta02[j,1] ~ normal(0,10); // vague prior
+    beta03[j,1] ~ normal(0,10); // vague prior
+    beta04[j,1] ~ normal(0,10); // vague prior
+    beta05[j,1] ~ normal(0,10); // vague prior
+    beta07[j,1] ~ normal(0,10); // vague prior
+    bs[j] ~ normal(0,10); // vague prior
+  }
+
+  // likelihoods
+  for ( i in 1:K){
+    for ( j in 1:N ) {
+      y[i,j] ~ normal(mu[i,j],sigma_r); // likelihood
+    }
+  }
+}
+
+```
+
+
+## Run Stan model 2, chemical data
+
+```{r}
+n_chains <- 6 # number of parallel chains in HMC inference
+fit <- sampling(
+  mod.chem, # stan model no1
+  data=data,
+  iter = 2000, 
+  warmup = 1000,
+  chains = n_chains
+  )
+print(head(summary(fit)$summary))
+
+#spath <- "/mnt/powervault/jonhall/project/2019/reservvatten/Analysis/"
+saveRDS(fit,"Save/model_chem.rds")
+#fit <- readRDS(file = paste(spath,"model_chem.rds",sep=""))
+fit <- readRDS(file = "Save/model_chem.rds")
+```
+
+## Check output from Stan analysis (i.e. assess posterior statistics)
+
+```{r posterior statistics of chem data analysis}
+aj_summary <- summary(fit, pars = c("beta3","beta4","beta5","beta7"), probs = c(0.05, 0.95))$summary
+#cat(sprintf('a_j parameter (to assess effect of contamination on ASVs):\n'))
+#print(aj_summary)
+df_post <- as.data.frame(fit)
+sig_par <- find_significance(aj_summary)
+```
+
+
+## Plots of inferred posterior distributions
+Using bayesplot R package, 80% probability mass highlighted with blue color
+
+
+```{r posterior visualizations of chem data analysis, echo=FALSE}
+posterior <- as.array(fit)
+# land-use effects
+p1 <- mcmc_areas(
+  posterior,
+  pars=c("beta4[1,1]","beta4[1,2]","beta4[2,1]","beta4[2,2]","beta4[3,1]","beta4[3,2]","beta4[4,1]","beta4[4,2]"), 
+  prob = 0.8,
+  prob_outer = 0.99,
+  point_est = "mean"
+  ); p1 #+
+# variance components
+p2 <- mcmc_areas(
+  posterior,
+  pars=c("sigma_g[1]","sigma_g[2]","sigma_g[3]","sigma_g[4]","sigma_t[1]","sigma_t[2]","sigma_t[3]","sigma_r"), 
+  prob = 0.8,
+  prob_outer = 0.99,
+  point_est = "mean"
+  ); p2 #+
+# lake effects
+p3 <- mcmc_areas(
+  posterior,
+  regex_pars = "beta4",
+  prob = 0.8,
+  prob_outer = 0.99,
+  point_est = "mean"
+  ); p3 #+
+## Add traceplot to check convergence of the 
+```
+
+
+## plot inferred posterior distributions of regression coefficients
+
+```{r}
+
+beta.tmp <- aj_summary[grep(',2',rownames(aj_summary)),]
+beta.3 <- as.data.frame(beta.tmp[grep('beta3',rownames(beta.tmp)),])
+beta.3$Variable <- vn
+beta.3$Predictor <- "Fields"
+beta.4 <- as.data.frame(beta.tmp[grep('beta4',rownames(beta.tmp)),])
+beta.4$Variable <- vn
+beta.4$Predictor <- "Buildings"
+beta.5 <- as.data.frame(beta.tmp[grep('beta5',rownames(beta.tmp)),])
+beta.5$Variable <- vn
+beta.5$Predictor <- "Farms"
+beta.7 <- as.data.frame(beta.tmp[grep('beta7',rownames(beta.tmp)),])
+beta.7$Variable <- vn
+beta.7$Predictor <- "Pasture"
+beta.tot <- rbind(beta.3,beta.4,beta.5,beta.7)
+
+pb3 <- plot_coef(beta.3,"Fields")
+pb4 <- plot_coef(beta.4,"Buildings")
+pb5 <- plot_coef(beta.5,"Farms")
+pb7 <- plot_coef(beta.7,"Pasture")
+
+ggsave(filename = paste(spath,"field_effect_chem.png",sep=""), plot = pb3)
+ggsave(filename = paste(spath,"building_effect_chem.png",sep=""), plot = pb4)
+ggsave(filename = paste(spath,"farms_effect_chem.png",sep=""), plot = pb5)
+ggsave(filename = paste(spath,"pasture_effect_chem.png",sep=""), plot = pb7)
+
+
+CIlow <-beta.tot$`5%`
+CIhigh <- beta.tot$`95%`
+  pchem <- beta.tot %>%
+  group_by(Predictor) %>%
+  #top_n(-10) %>%
+  ungroup() %>%
+  mutate(Predictor=as.factor(Predictor),
+         Variable=reorder_within(Variable,mean, Predictor)) %>%
+  ggplot(aes(x=Variable,y=mean)) + # ,color=Phylum sig.beta.tax, 
+  geom_point(size = 0.1) +
+  geom_pointrange(aes(ymin = CIlow,ymax = CIhigh)) +
+  facet_wrap(~Predictor, scales="free_y")+
+  coord_flip() +
+  theme_bw() +
+  xlab("Variable") +
+  ylab("Estimate") +
+  scale_x_reordered() +
+  geom_hline(yintercept=0,lty = 2) + 
+  scale_y_continuous(expand = c(0,0)) +
+    theme(axis.text.y = element_text(size = 8)); pchem #+ 
+  #theme(axis.text.y = element_blank()); pchem
+ggsave(filename = "Save/chem_joint_predictor_effect_ordered.png", plot = pchem,width = 10,height = 10)
+ggsave(filename = "Save/chem_joint_predictor_effect_ordered.pdf", plot = pchem,width = 10,height = 10)
+
+```
+
+## Create joint ASV - Chem data set
+Following Eriksson et al. (2022), we transformed the data to create a single dataset. In addition we pre-adjust observed data to account for systematic effects between study objects.
+
+## stan model 3 ASV data without specific antropogenic factors
+Following terms are included:
+fixed effects: year, timepoint, overall mean
+random effects: lake system, sampling site within lake system
+```{stan output.var="mod.asvs2"}
+data {
+
+  int L;	// number of lakes (i.e. no of 3-level groups)
+  int N;	// number of samples	
+  int K;	// number of measured outcomes
+  int M;	// number of 2st level factor combinations (i.e. sites at each lake system)
+  // outcome
+  int<lower=0> y[K,N]; 	// abundance matrix of outcome variables
+  // offset
+  int nseq[N];	// sequence depth of samples for normalizing abundance counts
+  // predictors
+  int<lower=1, upper=4> t[N];	// timepoint or sampling round effect (t = 1,2,3,4)
+  int<lower=1, upper=2> ye[N];	// year or batch effect (1 or 2)
+  int<lower=1, upper=2> type[N];	// type of water sample: 1 is a lake and 2 is an inflow
+  int<lower=1, upper=L> lev3ForLev2[M];	// lake system, level 3 in hierarchy
+  int<lower=1, upper=M> level2[N];	// sampling point, level 2 in hierarchy NB! Check max number of sampling points
+
+} 
+parameters {
+    
+  // Group level coefficient matrix NB check dimension!
+  matrix[K,3] beta01; // timepoint effect
+  matrix[K,1] beta02; // year effect
+  matrix[K,1] beta03; // lake/inflow effect
+  
+  vector[K] bs;	// coefficient for sequence depth covariate to be used as an offset in model
+
+  // varying intercepts 
+  vector[K] a;	// mean across sites
+  // residuals
+  vector[K] u_j[L]; 	// lake specific residual
+  vector[K] u_jk[M];	// lake x site residual
+//  vector[K] u_jkl[N];   // outcome specific residual, K for each of N samples
+  real<lower=0> phi[K]; // neg. binomial dispersion parameter, K dim, one per feature
+
+  real<lower=0.001> sigma_g[K]; // std dev of random intercept for lake
+  real<lower=0.001> sigma_t[K]; // std dev of random intercept for lake x site
+
+}
+transformed parameters {
+  matrix[K,4] beta1;
+  matrix[K,2] beta2;
+  matrix[K,2] beta3;
+  matrix[K,N] mu; // Individual mean for each response
+  vector[K] a_j[L]; 	// group coefficient for intercept of each lake
+  vector[K] a_jk[M]; 	// group coefficient for intercept of each lake x site
+  real logseq[N];
+
+  logseq = log(nseq);
+
+  // Varying intercepts definition
+  // Level-3 (L level-3 random intercepts)
+  for (j in 1:L) {
+    a_j[j] = a + u_j[j]; // lake system effect
+  }
+  // Level-2 (M level-2 random intercepts)
+  for (k in 1:M) {
+    a_jk[k] = a_j[lev3ForLev2[k]] + u_jk[k]; // lake x site effect
+  }
+  // sum-to-zero hard constraint on group level predictors
+  for (i in 1:K){
+    for (j in 1:3){
+      beta1[i,j] = beta01[i,j];
+    }
+    beta1[i,4] = -sum(beta01[i,]);
+    beta2[i,1] = beta02[i,1];
+    beta2[i,2] = -beta02[i,1];
+    beta3[i,1] = beta03[i,1];
+    beta3[i,2] = -beta03[i,1];
+  }
+  // Individual mean at the replicate level
+  for (i in 1:K) {
+    for (j in 1:N){
+      mu[i,j] = a_jk[level2[j],i] + beta1[i,t[j]] + beta2[i,ye[j]] + beta3[i,type[j]]; // NB! Check for three level group predictors
+    }
+  }
+}
+model {
+
+  // priors
+  for (j in 1:L)
+    u_j[j] ~ normal(0,sigma_g); // residual for lake
+  for (k in 1:M)
+    u_jk[k] ~ normal(0,sigma_t); // residual for site x lake
+    
+    // prior assigned to regression coefficients
+  for (j in 1:K ){
+    for (l in 1:3)
+      beta01[j,l] ~ normal(0,10); // vague prior
+    beta02[j,1] ~ normal(0,10); // vague prior
+    beta03[j,1] ~ normal(0,10); // vague prior
+    bs[j] ~ normal(0,10); // vague prior
+  }
+
+  for ( j in 1:K ) phi[j] ~ cauchy(0, 3); 	// dispersion parameter, 18 dim
+
+  // likelihoods
+  for ( i in 1:K){
+    for ( j in 1:N ) {
+      y[i,j] ~ neg_binomial_2_log(mu[i,j] + bs[i] * logseq[j],phi[i]); 
+    }
+  }
+}
+generated quantities {
+
+  real yadj[K,N];
+
+  for ( i in 1:K){
+    for ( j in 1:N ) {
+      yadj[i,j] = y[i,j] - mu[i,j]; // Adjusted abundance 
+    }
+  }
+}
+
+```
+
+
+## Set up pre-analysis ASV data
+```{r}
+# Step 1: pick out common samples
+common <- intersect(colnames(asvs2), meta.upd$SampleID)
+rownames(meta.upd) <- meta.upd$SampleID
+meta.q1 <- meta.upd[common,]
+asvs2.q1 <- asvs2[unique(sig.beta.tax$Variable),common] # pick out significant ASV:s
+# define numerical constants
+meta.q1$Lake <- as.factor(meta.q1$Lake)
+meta.q1$SamplePoint <- as.factor(meta.q1$SamplePoint)
+meta.q1$Run <- as.factor(meta.q1$Run)
+L <- nlevels(meta.q1$Lake)
+N <- ncol(asvs2.q1)
+M <- nlevels(meta.q1$SamplePoint)
+# define predictors
+nseq <- colSums(asvs2.q1)
+t <- rep(1,nrow(meta.q1))
+t[grep('18',meta.q1$SampleID)] <- 2
+t[grep('omg3',meta.q1$SampleID)] <- 3
+t[grep('omg4',meta.q1$SampleID)] <- 4
+ye <- as.numeric(meta.q1$Run)
+type <- rep(1,nrow(meta.q1))
+type[which(meta.q1$Type=="Point")] <- 2
+# define which random effect each sample and site is assigned to 
+level2 <- as.numeric(meta.q1$SamplePoint)
+lev3ForLev2 <- rep(1,M)
+lev3ForLev2[grep('Horn',levels(meta.q1$SamplePoint))] <- 2
+lev3ForLev2[grep('Okl',levels(meta.q1$SamplePoint))] <- 3 
+lev3ForLev2[grep('Skar',levels(meta.q1$SamplePoint))] <- 4
+lev3ForLev2[grep('Svar',levels(meta.q1$SamplePoint))] <- 5
+# outcome
+y <- asvs2.q1
+K <- nrow(y)
+# save dependent variable names
+vn <- rownames(y)
+data <- list(L=L,N=N,K=K,M=M,y=y,nseq=nseq,t=t,ye=ye,type=type,lev3ForLev2=lev3ForLev2,level2=level2)
+cat(sprintf("Final dimension: %d x %d\n",dim(y)[1],dim(y)[2]))
+
+
+```
+
+
+## Run Stan model 3, ASV data
+
+```{r}
+n_chains <- 8 # number of parallel chains in HMC inference
+fit.2 <- sampling(
+  mod.asvs2, # stan model no1
+  data=data,
+  iter = 2000, 
+  warmup = 1000,
+  chains = n_chains
+  )
+print(head(summary(fit)$summary))
+
+spath <- "Save/"
+saveRDS(fit.2, paste(spath,"model_asvs_step2_n27.rds",sep=""))
+# if analysis already saved
+fit.2 <- readRDS(paste(spath,"model_asvs_step2_n27.rds",sep=""))
+```
+## Plot posterior estimates of adjustment effects
+
+```{r}
+aj_summary.t <- summary(fit.2, pars = c("beta1","beta2","beta3"), probs = c(0.025, 0.975))$summary #,"sigma_g","sigma_t"
+#cat(sprintf('a_j parameter (to assess effect of contamination on ASVs):\n'))
+#print(aj_summary)
+aj_summary.v <- summary(fit.2, pars = c("sigma_g","sigma_t"), probs = c(0.025, 0.975))$summary 
+sig_par <- find_significance(aj_summary)
+cat(sprintf(""))
+aj_summary.aj <- summary(fit.2, pars = "a_j", probs = c(0.025, 0.975))$summary 
+aj_summary.ajk <- summary(fit.2, pars = "a_jk", probs = c(0.025, 0.975))$summary 
+posterior <- as.matrix(fit.2)
+plot_title <- ggtitle("Posterior distribution of lake variance on ASV abundance",
+                      "with medians and 80% intervals")
+par.name <- paste("sigma_g[",seq(1,K),"]",sep="")
+# pvar1 <- mcmc_areas(posterior,
+#           pars = par.name,
+#           prob = 0.8) + plot_title; pvar1
+plot_title <- ggtitle("Posterior distribution of lake x site variance on ASV abundance",
+                      "with medians and 80% intervals")
+par.name <- paste("sigma_t[",seq(1,K),"]",sep="")
+#pvar2 <- mcmc_areas(posterior,
+#           pars = par.name,
+#           prob = 0.8) + plot_title; pvar2
+
+# Step 2: adjust phenotypes (i.e. abundance)
+yadj = y 
+for ( i in 1:K){
+    for ( j in 1:N ) {
+      yadj[i,j] = mean(posterior[,paste("yadj[",i,",",j,"]",sep="")]) #; // Adjusted abundance 
+    }
+  }
+# Step 3: normalize sample counts for abundance data
+yadj2 <- yadj/rowSums(yadj)
+# Step 4: normalize variable contribution so that mu = 0 and std dev = 1
+yadj2 <- t(scale(t(yadj2)))
+write.table(x = yadj2,file = "adjusted_ASV_for_banjo_27x63.txt",quote = F,sep="\t")
+# Add unadjusted data 
+# normalize sample counts for abundance data
+y2 <- y/rowSums(y)
+# normalize variable contribution so that mu = 0 and std dev = 1
+y2 <- t(scale(t(y2)))
+colnames(y2) <- meta.upd2$SampleID
+write.table(x = y2,file = "Unadjusted_ASV_for_banjo_27x63.txt",quote = F,sep="\t")
+```
+
+## Analysis of chem data to pre-adjusting observations
+stan model 4 Chemical data without specific antropogenic factors
+Following terms are included:
+fixed effects: year, timepoint, overall mean
+random effects: lake system, sampling site within lake system
+```{stan output.var="mod.chem2"}
+data {
+
+  int L;	// number of lakes (i.e. no of 3-level groups)
+  int N;	// number of samples	
+  int K;	// number of measured outcomes
+  int M;	// number of 2st level factor combinations (i.e. sites at each lake system)
+  // outcome
+  real y[K,N]; 	// abundance matrix of outcome variables
+  // predictors
+  int<lower=1, upper=4> t[N];	// timepoint or sampling round effect (t = 1,2,3,4)
+  int<lower=1, upper=2> ye[N];	// year or batch effect (1 or 2)
+  int<lower=1, upper=2> type[N];	// type of water sample: 1 is a lake and 2 is an inflow
+  int<lower=1, upper=L> lev3ForLev2[M];	// lake system, level 3 in hierarchy
+  int<lower=1, upper=M> level2[N];	// sampling point, level 2 in hierarchy NB! Check max number of sampling points
+
+} 
+parameters {
+    
+  // Group level coefficient matrix NB check dimension!
+  matrix[K,3] beta01; // timepoint effect
+  matrix[K,1] beta02; // year effect
+  matrix[K,1] beta03; // lake/inflow effect
+  // varying intercepts 
+  vector[K] a;	// mean across sites
+  // residuals
+  vector[K] u_j[L]; 	// lake specific residual
+  vector[K] u_jk[M];	// lake x site residual
+
+  real<lower=0.001> sigma_g[K]; // std dev of random intercept for lake
+  real<lower=0.001> sigma_t[K]; // std dev of random intercept for lake x site
+  real<lower=0.001> sigma_r; //  Residual std dev
+}
+transformed parameters {
+  matrix[K,4] beta1;
+  matrix[K,2] beta2;
+  matrix[K,2] beta3;
+  matrix[K,N] mu; // Individual mean for each response
+  vector[K] a_j[L]; 	// group coefficient for intercept of each lake
+  vector[K] a_jk[M]; 	// group coefficient for intercept of each lake x site
+
+
+  // Varying intercepts definition
+  // Level-3 (L level-3 random intercepts)
+  for (j in 1:L) {
+    a_j[j] = a + u_j[j]; // lake system effect
+  }
+  // Level-2 (M level-2 random intercepts)
+  for (k in 1:M) {
+    a_jk[k] = a_j[lev3ForLev2[k]] + u_jk[k]; // lake x site effect
+  }
+  // sum-to-zero hard constraint on group level predictors
+  for (i in 1:K){
+    for (j in 1:3){
+      beta1[i,j] = beta01[i,j];
+    }
+    beta1[i,4] = -sum(beta01[i,]);
+    beta2[i,1] = beta02[i,1];
+    beta2[i,2] = -beta02[i,1];
+    beta3[i,1] = beta03[i,1];
+    beta3[i,2] = -beta03[i,1];
+
+  }
+  // Individual mean at the replicate level
+  for (i in 1:K) {
+    for (j in 1:N){
+      mu[i,j] = a_jk[level2[j],i] + beta1[i,t[j]] + beta2[i,ye[j]] + beta3[i,type[j]]; // NB! Check for three level group predictors
+    }
+  }
+}
+model {
+
+  // priors
+  for (j in 1:L)
+    u_j[j] ~ normal(0,sigma_g); // residual for lake
+  for (k in 1:M)
+    u_jk[k] ~ normal(0,sigma_t); // residual for site x lake
+    
+    // prior assigned to regression coefficients
+  for (j in 1:K ){
+    for (l in 1:3)
+      beta01[j,l] ~ normal(0,10); // vague prior
+    beta02[j,1] ~ normal(0,10); // vague prior
+    beta03[j,1] ~ normal(0,10); // vague prior
+  }
+
+  // likelihoods
+  for ( i in 1:K){
+    for ( j in 1:N ) {
+      y[i,j] ~ normal(mu[i,j],sigma_r); 
+    }
+  }
+}
+generated quantities {
+
+  real yadj[K,N];
+
+  for ( i in 1:K){
+    for ( j in 1:N ) {
+      yadj[i,j] = y[i,j] - mu[i,j]; // Adjusted abundance 
+    }
+  }
+}
+
+```
+
+
+## Set up chemical data analysis
+
+```{r}
+meta.q1 <- as.data.frame(meta.q1)
+meta.q1$logColiforms <- log(meta.q1$Coliforms+0.001) # use log-transform
+meta.q1$logEcoli<-log(meta.q1$`E. coli`+0.3)
+meta.q1$logEntero <- log(meta.q1$Entero+0.1)
+meta.q1$logCperf <- log(meta.q1$`C. perf`+0.8)
+meta.q1$logTurbidity <- log(meta.q1$Turbidity)
+meta.q1$logColorVal <- log(meta.q1$ColorVal)
+meta.q1$exppH <- exp(meta.q1$pH)
+meta.q1$logAlkalinity <- log(meta.q1$Alkalinity+0.001)
+meta.q1$logCODMn <- log(meta.q1$CODMn)
+meta.q1$logConductivity <- log(meta.q1$Conductivity)
+meta.q1$logTotalHardness <- log(meta.q1$TotalHardness)
+meta.q1$logSulfate <- log(meta.q1$Sulfate)
+meta.q1$logAmmonium <-log(meta.q1$Ammonium+0.001)
+meta.q1$logAmmonium_nitrogen <-log(meta.q1$Ammonium_nitrogen+0.001)
+meta.q1$logNitrate <-log(meta.q1$Nitrate+0.001)
+meta.q1$logNitrate_nitrogen <-log(meta.q1$Nitrate_nitrogen+0.001)
+meta.q1$logCalcium <-log(meta.q1$Calcium)
+meta.q1$logIron <-log(meta.q1$Iron)
+meta.q1$logMagnesium <-log(meta.q1$Magnesium)
+meta.q1$logManganese <-log(meta.q1$Manganese)
+meta.q1$logAluminium <-log(meta.q1$Aluminium)
+meta.q1$logCopper <-log(meta.q1$Copper+0.001)
+# remove missing data
+cat(sprintf('Number of samples with chemical records %d\n',nrow(meta.q1)))
+meta.upd2 <- meta.q1
+# define numerical constants
+meta.upd2$Lake <- as.factor(meta.upd2$Lake)
+meta.upd2$SamplePoint <- as.factor(meta.upd2$SamplePoint)
+meta.upd2$Run <- as.factor(meta.upd2$Run)
+
+L <- nlevels(meta.upd2$Lake)
+N <- nrow(meta.upd2)
+M <- nlevels(meta.upd2$SamplePoint)
+# define predictors
+t <- rep(1,nrow(meta.upd2))
+t[grep('18',meta.upd2$SampleID)] <- 2
+t[grep('omg3',meta.upd2$SampleID)] <- 3
+t[grep('omg4',meta.upd2$SampleID)] <- 4
+ye <- as.numeric(meta.upd2$Run)
+type <- rep(1,nrow(meta.upd2))
+type[which(meta.upd2$Type=="Point")] <- 2
+
+# define which random effect each sample and site is assigned to 
+level2 <- as.numeric(meta.upd2$SamplePoint)
+lev3ForLev2 <- rep(1,M)
+lev3ForLev2[grep('Horn',levels(meta.upd2$SamplePoint))] <- 2
+lev3ForLev2[grep('Okl',levels(meta.upd2$SamplePoint))] <- 3 
+lev3ForLev2[grep('Skar',levels(meta.upd2$SamplePoint))] <- 4
+lev3ForLev2[grep('Svar',levels(meta.upd2$SamplePoint))] <- 5
+# outcome
+# NB! select columns
+# [13:19] Björn (Guest)
+# totalHardness, Sodim, Turbidity, ColorValue, pH, Nitrat, Ammonium, Manganese, Koppar, Aluminium
+
+
+y <- meta.upd2 %>%
+  select(c(Sodium,logTurbidity,logColorVal,exppH,logTotalHardness,logAmmonium,logNitrate,logManganese,logAluminium,logCopper)) %>%
+  t()
+# save dependent variable names
+vn <- c("Sodium","logTurbidity","logColorVal","exppH","logTotalHardness","logAmmonium","logNitrate","logManganese","logAluminium","logCopper") #colnames(meta.upd2[,c(34,40,41,seq(52,69))])
+# scale outcome to mean zero and unit variance
+y <- t(scale(t(y)))
+cat(sprintf('Dim: %d x %d\n',dim(y)[1],dim(y)[2]))
+K <- nrow(y)
+data <- list(L=L,N=N,K=K,M=M,y=y,t=t,ye=ye,type=type,lev3ForLev2=lev3ForLev2,level2=level2)
+
+```
+## HMC sampling using Stan to obtain posterior estimates
+
+```{r}
+n_chains <- 8 # number of parallel chains in HMC inference
+fit.5 <- sampling(
+  mod.chem2, # stan model no1
+  data=data,
+  iter = 2000, 
+  warmup = 1000,
+  chains = n_chains
+  )
+print(head(summary(fit)$summary))
+
+spath <- "Save/"
+saveRDS(fit.5, paste(spath,"model_chem_step2_n10.rds",sep=""))
+# if analysis already saved
+fit.5 <- readRDS(paste(spath,"model_chem_step2_n10.rds",sep=""))
+aj_summary.ajk <- summary(fit.5, pars = "a_jk", probs = c(0.025, 0.975))$summary 
+posterior <- as.matrix(fit.5)
+plot_title <- ggtitle("Posterior distribution of lake variance on chemical substance abundance",
+                      "with medians and 80% intervals")
+par.name <- paste("sigma_g[",seq(1,K),"]",sep="")
+# pvar1 <- mcmc_areas(posterior,
+#           pars = par.name,
+#           prob = 0.8) + plot_title; pvar1
+plot_title <- ggtitle("Posterior distribution of lake x site variance on chemical substance abundance",
+                      "with medians and 80% intervals")
+par.name <- paste("sigma_t[",seq(1,K),"]",sep="")
+#pvar2 <- mcmc_areas(posterior,
+#           pars = par.name,
+#           prob = 0.8) + plot_title; pvar2
+
+# Step 2: adjust phenotypes (i.e. abundance)
+# Already obtained from Stan analysis as generated quaniles
+
+# Step 3: normalize sample contribution for abundance data
+
+# Step 4: normalize variable contribution so that mu = 0 and std dev = 1
+yadj = y 
+for ( i in 1:K){
+    for ( j in 1:N ) {
+      yadj[i,j] = mean(posterior[,paste("yadj[",i,",",j,"]",sep="")]) #; // Adjusted abundance 
+    }
+}
+
+# Step 3: normalize sample counts for abundance data
+yadj2 <- yadj/rowSums(yadj)
+# Step 4: normalize variable contribution so that mu = 0 and std dev = 1
+yadj2 <- t(scale(t(yadj2)))
+colnames(yadj2) <- meta.upd2$SampleID
+write.table(x = yadj2,file = "adjusted_chem_for_banjo_10x63.txt",quote = F,sep="\t")
+# Add unadjusted data 
+# normalize sample counts for abundance data
+y2 <- y/rowSums(y)
+# normalize variable contribution so that mu = 0 and std dev = 1
+y2 <- t(scale(t(y2)))
+colnames(y2) <- meta.upd2$SampleID
+write.table(x = y2,file = "Unadjusted_chem_for_banjo_10x63.txt",quote = F,sep="\t")
+```
+
+## Analysis of alpha diversity
+Running Stan model 2. First, set up data
+```{r}
+# Step 1: load data
+alpha.div <- read.table("C:/Documents and Settings/joah/OneDrive - Skogforsk/Documents/Projekt/Old/Reservvatten/LandUse/alphadiv.tsv")
+alpha.div <- alpha.div %>% 
+  select(c(chao1,diversity_shannon,diversity_fisher,sam_name))
+# Step 2: transform data
+alpha.div[,1:3] <- scale(alpha.div[,1:3])
+# Step 3: merge data
+alpha.div <- rename(alpha.div, SampleID = sam_name)
+meta <- meta %>% 
+  rownames_to_column() %>% 
+  rename(SampleID = rowname)
+meta.alpha <- merge(alpha.div,meta,by = "SampleID")
+# Step 4: select relevant data (inflows)
+meta.q1 <- subset(meta.alpha,Type=='Point')
+meta.q1$Lake <- as.factor(meta.q1$Lake)
+meta.q1$SamplePoint <- as.factor(meta.q1$SamplePoint)
+meta.q1$Run <- as.factor(meta.q1$Run)
+meta.q1$Surround <- as.factor(meta.q1$Surround)
+meta.q1$UpstreamBuild <- as.factor(meta.q1$UpstreamBuild)
+meta.q1$UpstreamFarm <- as.factor(meta.q1$UpstreamFarm)
+meta.q1$`Size(stream)` <- as.factor(meta.q1$`Size(stream)`)
+L <- nlevels(meta.q1$Lake)
+N <- nrow(meta.q1) # number of samples
+M <- nlevels(meta.q1$SamplePoint)
+# define predictors
+t <- rep(1,nrow(meta.q1))
+t[grep('18',meta.q1$SampleID)] <- 2
+t[grep('omg3',meta.q1$SampleID)] <- 3
+t[grep('omg4',meta.q1$SampleID)] <- 4
+ye <- as.numeric(meta.q1$Run)
+su <- as.numeric(meta.q1$Surround)
+bu <- as.numeric(meta.q1$UpstreamBuild)
+fa <- as.numeric(meta.q1$UpstreamFarm)
+si <- as.numeric(meta.q1$`Size(stream)`)
+pa <- as.numeric(meta.q1$UpstreamPast)+1
+# NB! Update
+si[which(is.na(si))] <- 3
+# define which random effect each sample and site is assigned to 
+level2 <- as.numeric(meta.q1$SamplePoint)
+lev3ForLev2 <- rep(1,M)
+lev3ForLev2[grep('Horn',levels(meta.q1$SamplePoint))] <- 2
+lev3ForLev2[grep('Okl',levels(meta.q1$SamplePoint))] <- 3 
+lev3ForLev2[grep('Skar',levels(meta.q1$SamplePoint))] <- 4
+lev3ForLev2[grep('Svar',levels(meta.q1$SamplePoint))] <- 5
+# outcome
+y <- meta.q1 %>%
+  select(c(chao1,diversity_shannon,diversity_fisher)) %>%
+  t()
+K <- nrow(y)
+# save dependent variable names
+vn <- rownames(y)
+su[which(su==3)]<-2 # only two factor levels
+data <- list(L=L,N=N,K=K,M=M,y=y,t=t,ye=ye,su=su,bu=bu,fa=fa,si=si,pa=pa,lev3ForLev2=lev3ForLev2,level2=level2)
+cat(sprintf("Final dimension: %d x %d\n",dim(y)[1],dim(y)[2]))
+```
+## Adjust Chemical data
+First 
+
+## Run Stan model 2, alpha diversity data
+
+```{r}
+n_chains <- 7 # number of parallel chains in HMC inferrence
+fit.4 <- sampling(
+  mod.chem, # stan model no1
+  data=data,
+  iter = 2000, 
+  warmup = 1000,
+  chains = n_chains
+  )
+print(head(summary(fit)$summary))
+
+spath <- "C:/Documents and Settings/joah/OneDrive - Skogforsk/Documents/Projekt/Old/Reservvatten/LandUse/"
+saveRDS(fit.4, paste(spath,"model_alpha.rds",sep="")) # _wo_scale
+fit.4 <- readRDS(file = paste(spath,"model_alpha.rds",sep="")) # _wo_scale
+```
+
+## Check alpha diversity results from Stan analysis (i.e. assess posterior statistics)
+
+```{r posterior statistics alpha diversity}
+aj_summary <- summary(fit.4, pars = c("beta3","beta4","beta5","beta7"), probs = c(0.05, 0.95))$summary
+#cat(sprintf('a_j parameter (to assess effect of contamination on ASVs):\n'))
+#print(aj_summary)
+df_post <- as.data.frame(fit.4)
+sig_par <- find_significance(aj_summary)
+beta.tmp <- aj_summary[grep(',2',rownames(aj_summary)),]
+beta.3 <- as.data.frame(beta.tmp[grep('beta3',rownames(beta.tmp)),])
+beta.3$Variable <- vn
+beta.3$Predictor <- "Fields"
+beta.4 <- as.data.frame(beta.tmp[grep('beta4',rownames(beta.tmp)),])
+beta.4$Variable <- vn
+beta.4$Predictor <- "Buildings"
+beta.5 <- as.data.frame(beta.tmp[grep('beta5',rownames(beta.tmp)),])
+beta.5$Variable <- vn
+beta.5$Predictor <- "Farms"
+beta.7 <- as.data.frame(beta.tmp[grep('beta7',rownames(beta.tmp)),])
+beta.7$Variable <- vn
+beta.7$Predictor <- "Pasture"
+
+beta.tot <- rbind(beta.3,beta.4,beta.5,beta.7)
+CIlow <-beta.tot[,4]
+CIhigh <- beta.tot[,5]
+  p <- beta.tot %>%
+  group_by(Predictor) %>%
+  top_n(-10) %>%
+  ungroup() %>%
+  mutate(Predictor=as.factor(Predictor),
+         Variable=reorder_within(Variable,mean, Predictor)) %>%
+  ggplot(aes(x=Variable,y=mean)) +
+  geom_point(size = 0.1) +
+  geom_pointrange(aes(ymin = CIlow,ymax = CIhigh),color = ifelse(CIlow < 0 & CIhigh > 0, "red","darkblue")) +
+  facet_wrap(~Predictor, scales="free_y")+
+  coord_flip() +
+  theme_bw() +
+  xlab("Variable") +
+  ylab("Estimate") +
+  scale_x_reordered() +
+  geom_hline(yintercept=0,lty = 2) + 
+  scale_y_continuous(expand = c(0,0)); p #+ 
+ # theme(axis.text.y = element_blank()); p
+ggsave(filename = "Figures/alpha_div_joint_predictor_effect_ordered.png", plot = p)
+```
+
+## Checking ASVs in lakes for anthropogenic disturbance
+
+```{r}
+# filter data
+meta.q1 <- meta[which(meta$Type!='Point'),seq(1,26)]
+common <- intersect(colnames(asvs2), meta.q1$SampleID)
+#asvs2 <- otu_full[order(rowSums(otu_full),decreasing = TRUE)[1:top_limit],]
+asvs2.q1<-otu_full[,common]
+asvs2.q1<-asvs2.q1[order(rowSums(asvs2.q1),decreasing = TRUE)[1:top_limit],]
+rownames(meta.q1) <- meta.q1$SampleID
+meta.q1 <- meta.q1[common,]
+meta.q1 <- select(meta.q1,-c(Surround,UpstreamBuild,UpstreamFarm,UpstreamPast,`Size(stream)`))
+cat(sprintf("Dimension after removing lake samples: %d x %d\n",dim(asvs2.q1)[1],dim(asvs2.q1)[2]))
+# define numerical constants
+meta.q1$Lake <- as.factor(meta.q1$Lake)
+meta.q1$SamplePoint <- as.factor(meta.q1$SamplePoint)
+meta.q1$Run <- as.factor(meta.q1$Run)
+colnames(meta.q1)[c(8,10)] <- c("E.coli","C.perfringens")
+L <- nlevels(meta.q1$Lake)
+N <- ncol(asvs2.q1)
+M <- nlevels(meta.q1$SamplePoint)
+# define predictors
+nseq <- colSums(asvs2.q1)
+t <- rep(1,nrow(meta.q1))
+t[grep('18',meta.q1$SampleID)] <- 2
+t[grep('omg3',meta.q1$SampleID)] <- 3
+t[grep('omg4',meta.q1$SampleID)] <- 4
+ye <- as.numeric(meta.q1$Run)
+
+# define which random effect each sample and site is assigned to 
+level2 <- as.numeric(meta.q1$SamplePoint)
+lev3ForLev2 <- rep(1,M)
+lev3ForLev2[grep('Horn',levels(meta.q1$SamplePoint))] <- 2
+lev3ForLev2[grep('Okl',levels(meta.q1$SamplePoint))] <- 3 
+lev3ForLev2[grep('Skar',levels(meta.q1$SamplePoint))] <- 4
+lev3ForLev2[grep('Svar',levels(meta.q1$SamplePoint))] <- 5
+# outcome
+y <- asvs2.q1
+# add indicators
+y <- rbind(y,t(round(select(meta.q1,c(Coliforms,E.coli,Entero,C.perfringens)))))
+K <- nrow(y)
+# save dependent variable names
+vn <- rownames(y)
+
+# define lake specific predictors 
+
+X <- meta.q1 %>%
+  group_by(Lake) %>% 
+  summarize(Volume,Shoreline,WS.Frac.Forest.Area,WS.Frac.Farm.Area) %>% # Area,Elevation,Ave.Depth,Max.Depth,Shoreline,Volume,WS.Area,WS.Ac.Area,WS.Frac.Water.Area,WS.Frac.Forest.Area,
+  unique() %>%
+  mutate(volratio = Volume/Shoreline) %>%
+  as.data.frame()
+rownames(X) <- X$Lake
+X <- select(X,-c(Lake,Volume,Shoreline)) # ,Max.Depth,WS.Ac.Area,WS.Frac.Water.Area
+X <- X %>%
+  as.vector() %>%  
+   scale() %>%
+  t()
+O <- nrow(X)
+#X <- array(X)
+X1 <- X[1,]
+X2 <- X[2,]
+X3 <- X[3,]
+data <- list(L=L,N=N,K=K,M=M,y=y,nseq=nseq,t=t,ye=ye,X1=X1,X2=X2,X3=X3,lev3ForLev2=lev3ForLev2,level2=level2,nseq=nseq)
+cat(sprintf("Final dimension: %d x %d\n",dim(y)[1],dim(y)[2]))
+```
+
+## Stan model for lake ASV analysis assuming negative binomial likelihood
+
+
+```{stan output.var=asv.mod.lake}
+data {
+
+  int L;	// number of lakes (i.e. no of 3-level groups)
+  int N;	// number of samples	
+  int K;	// number of measured outcomes
+  int M;	// number of 2st level factor combinations (i.e. sites at each lake system)
+
+  // outcome
+  int<lower=0> y[K,N]; 	// abundance matrix of outcome variables
+  // offset
+  int nseq[N];	// sequence depth of samples for normalizing abundance counts
+  // predictors
+  int<lower=1, upper=4> t[N];	// timepoint or sampling round effect (t = 1,2,3,4)
+  int<lower=1, upper=2> ye[N];	// year or batch effect (0 or 1)
+  vector[L] X1; // the model matrix with predictors, scaled to unit variance, zero mean, for L lakes
+  vector[L] X2;
+  vector[L] X3;
+  int<lower=1, upper=L> lev3ForLev2[M];	// lake system, level 3 in hierarchy
+  int<lower=1, upper=M> level2[N];	// sampling point, level 2 in hierarchy NB! Check max number of sampling points
+
+} 
+parameters {
+    
+  // Group level coefficient matrix NB check dimension!
+  matrix[K,3] beta01;
+  matrix[K,1] beta02;
+  vector[K] alpha1; // covariates, K dim
+  vector[K] alpha2; // covariates, K dim
+  vector[K] alpha3; // covariates, K dim
+  vector[K] bs;	// coefficient for sequence depth covariate o be used as an offset in model
+
+  // varying intercepts 
+  vector[K] a;	// mean across sites
+  // residuals
+  vector[K] u_j[L]; 	// lake specific residual
+  vector[K] u_jk[M];	// lake x site residual
+//  vector[K] u_jkl[N];   // outcome specific residual, K for each of N samples
+  real<lower=0> phi[K]; // neg. binomial dispersion parameter, K dim, one per feature
+
+  real<lower=0.001> sigma_g[K]; // std dev of random intercept for lake
+  real<lower=0.001> sigma_t[K]; // std dev of random intercept for lake x site
+
+}
+transformed parameters {
+  matrix[K,4] beta1;
+  matrix[K,2] beta2;
+  matrix[K,N] mu; // Individual mean for each response
+  vector[K] a_j[L]; 	// group coefficient for intercept of each site
+  vector[K] a_jk[M]; 	// group coefficient for intercept of each location x site
+  real logseq[N];
+
+  logseq = log(nseq);
+
+  // Varying intercepts definition
+  // Level-3 (L level-3 random intercepts)
+  for (j in 1:L) {
+    a_j[j] = a + alpha1 * X1[j] + alpha2 * X2[j] + alpha3 * X3[j] + u_j[j]; // lake system effect NB NB NB check dimension!!!!
+  }
+  // Level-2 (M level-2 random intercepts)
+  for (k in 1:M) {
+    a_jk[k] = a_j[lev3ForLev2[k]] + u_jk[k]; // lake x site effect
+  }
+  // sum-to-zero hard constraint on group level predictors
+  for (i in 1:K){
+    for (j in 1:3){
+      beta1[i,j] = beta01[i,j];
+    }
+    beta1[i,4] = -sum(beta01[i,]);
+    beta2[i,1] = beta02[i,1];
+    beta2[i,2] = -beta02[i,1];
+
+  }
+  // Individual mean at the replicate level
+  for (i in 1:K) {
+    for (j in 1:N){
+      mu[i,j] = a_jk[level2[j],i] + beta1[i,t[j]] + beta2[i,ye[j]]; // NB! Check for three level group predictors
+    }
+  }
+}
+model {
+
+  // priors
+  for (j in 1:L)
+    u_j[j] ~ normal(0,sigma_g); // residual for site
+  for (k in 1:M)
+    u_jk[k] ~ normal(0,sigma_t); // residual for site x location
+    
+    // prior assigned to regression coefficients
+  for (j in 1:K ){
+    for (l in 1:3)
+      beta01[j,l] ~ normal(0,10); // vague prior
+    alpha1[j] ~ normal(0,10);
+    alpha2[j] ~ normal(0,10);
+    alpha3[j] ~ normal(0,10);
+    beta02[j,1] ~ normal(0,10); // vague prior
+    bs[j] ~ normal(0,10); // vague prior
+  }
+
+  for ( j in 1:K ) phi[j] ~ cauchy(0, 3); 	// dispersion parameter
+
+  // likelihoods
+  for ( i in 1:K){
+    for ( j in 1:N ) {
+      y[i,j] ~ neg_binomial_2_log(mu[i,j] + bs[i] * logseq[j],phi[i]); 
+    }
+  }
+}
+
+
+```
+
+## Run Stan model, ASV lake data
+
+```{r}
+n_chains <- 7 # number of parallel chains in HMC inference
+fit.9 <- sampling(
+  asv.mod.lake, # stan model
+  data=data,
+  iter = 1500, 
+  warmup = 750,
+  chains = n_chains
+  )
+print(head(summary(fit)$summary))
+
+spath <- "C:/Documents and Settings/joah/OneDrive - Skogforsk/Documents/Projekt/Old/Reservvatten/LandUse/"
+saveRDS(fit.9, paste(spath,"model_lake_ASVs_v2.rds",sep=""))
+fit.9 <- readRDS(file = paste(spath,"model_lake_ASVs_v2.rds",sep=""))
+```
+
+## Assessing Stan analysis lake data
+
+```{r}
+aj_summary <- summary(fit.9, pars = c("beta1","beta2","alpha1","alpha2","alpha3"), probs = c(0.025, 0.975))$summary # 
+#cat(sprintf('a_j parameter (to assess effect of contamination on ASVs):\n'))
+#print(aj_summary)
+
+sig_par <- find_significance(aj_summary)
+cat(sprintf('significant inferred regression coefficients (to assess effect of contamination on ASVs):\n'))
+print(sig_par)
+aj_summary2 <- summary(fit.9, pars =  c("beta1","beta2","alpha1","alpha2","alpha3"), probs = c(0.05, 0.95))$summary # 
+#cat(sprintf('a_j parameter (to assess effect of contamination on ASVs):\n'))
+#print(aj_summary)
+
+sig_par2 <- find_significance(aj_summary2)
+cat(sprintf('significant inferred regression coefficients (to assess effect of contamination on ASVs):\n'))
+print(sig_par2)
+```
+## Coefficient plots
+
+```{r}
+alpha.tmp <- aj_summary[grep('alpha',rownames(aj_summary)),]
+alpha.1 <- as.data.frame(alpha.tmp[grep('alpha1',rownames(alpha.tmp)),])
+alpha.1$Variable <- vn
+alpha.1$Predictor <- "Forest"
+alpha.2 <- as.data.frame(alpha.tmp[grep('alpha2',rownames(alpha.tmp)),])
+alpha.2$Variable <- vn
+alpha.2$Predictor <- "Farm"
+alpha.3 <- as.data.frame(alpha.tmp[grep('alpha3',rownames(alpha.tmp)),])
+alpha.3$Variable <- vn
+alpha.3$Predictor <- "VOlumeRatio"
+
+
+
+alpha.tot <- rbind(alpha.1,alpha.2,alpha.3)
+
+
+########## joint figure
+
+
+CIlow <-alpha.tot[,4]
+CIhigh <- alpha.tot[,5]
+p <- alpha.tot %>%
+  group_by(Predictor) %>%
+  top_n(-10) %>%
+  ungroup() %>%
+  mutate(Predictor=as.factor(Predictor),
+         Variable=reorder_within(Variable,mean, Predictor)) %>%
+  ggplot(aes(x=Variable,y=mean)) +
+  geom_point(size = 0.1) +
+  geom_pointrange(aes(ymin = CIlow,ymax = CIhigh),color = ifelse(CIlow < 0 & CIhigh > 0, "red","darkblue")) +
+  facet_wrap(~Predictor, scales="free_y")+
+  coord_flip() +
+  theme_bw() +
+  xlab("Variable") +
+  ylab("Estimate") +
+  scale_x_reordered() +
+  geom_hline(yintercept=0,lty = 2) + 
+  scale_y_continuous(expand = c(0,0)) + 
+  theme(axis.text.y = element_blank()); p
+ggsave(filename = "Save/Lakes_top100_asvs_joint_predictor_effect_ordered.png", plot = p)
+
+
+## adding taxonomic info ##
+tax2 <- as.data.frame(tax2)
+tax2$Variable = rownames(tax2)
+alpha.tax <- merge(alpha.tot,tax2,by="Variable") # merge taxonomy and coefficient estimates
+#sig.beta.tax <- beta.tax %>%
+#  filter(`2.5%` > 0 | `97.5%` < 0)
+
+CIlow <-alpha.tax[,5]
+CIhigh <- alpha.tax[,6]
+  p2 <- alpha.tax %>%
+  group_by(Predictor) %>%
+  #top_n(-10) %>%
+  ungroup() %>%
+  mutate(Predictor=as.factor(Predictor),
+         Variable=reorder_within(Variable,mean, Predictor)) %>%
+  ggplot(aes(x=Variable,y=mean,color=Genus)) + # ,color=Phylum sig.beta.tax, 
+  geom_point(size = 0.1) +
+  geom_pointrange(aes(ymin = CIlow,ymax = CIhigh)) +
+  facet_wrap(~Predictor, scales="free_y")+
+  coord_flip() +
+  theme_bw() +
+  xlab("Variable") +
+  ylab("Estimate") +
+  scale_x_reordered() +
+  geom_hline(yintercept=0,lty = 2) + 
+  scale_y_continuous(expand = c(0,0)) + 
+  theme(axis.text.y = element_blank()); p2
+ggsave(filename = "Figures/lakes_top100_asvs_joint_predictor_effect_significant_with_genus_ordered.png", plot = p2)
+
+table.alpha <- alpha.tax %>%
+  select(-c(se_mean,n_eff,Rhat)) %>%
+   group_by(Predictor) %>%
+   arrange(Predictor, desc(mean)) %>% 
+  mutate_if(is.numeric, round, digits = 2)
+write.table(table.alpha,file = "Save/Table_asvs_lake.txt",quote = F,sep="\t",row.names = F)
+
+```
+
+## Checking Legionella
+Trying negative binomial likelihood function (i.e. for count data).
+
+```{r}
+# Pick out Legionella at the genus level in tax table
+cat(sprintf('Searching among %d taxa for legionella...\n',dim(tax_full)[1]))
+asv_leg <- otu_full[grep('Legionella',tax_full[,6]),] # NB order the same!
+cat(sprintf('Found %d legionella at the genus level...\n',dim(asv_leg)[1]))
+# Remove asvs only present in 2 or 1 communities
+                             # Replacing values
+
+# filter data
+meta.q1 <- meta[which(meta$Type=='Point'),]
+common <- intersect(colnames(asv_leg), meta.q1$SampleID)
+asv_leg.q1<-asv_leg[,common]
+y_all <- matrix(colSums(asv_leg.q1),1,ncol(asv_leg.q1))
+otu_red <- otu_full[,common]
+rownames(meta.q1) <- meta.q1$SampleID
+meta.q1 <- meta.q1[common,]
+cat(sprintf("Dimension after removing lake samples: %d x %d\n",dim(asv_leg.q1)[1],dim(asv_leg.q1)[2]))
+
+##### further filtering
+asv_leg.pres <- asv_leg.q1
+asv_leg.pres[asv_leg.pres > 0] <- 1
+asv_leg.red.q1 <- asv_leg.q1[which(rowSums(asv_leg.pres) > 8),]
+cat(sprintf('Found %d legionella at the genus level after removing asvs only present in 2 or fewer samples\n',dim(asv_leg.red.q1)[1]))
+# define numerical constants
+meta.q1$Lake <- as.factor(meta.q1$Lake)
+meta.q1$SamplePoint <- as.factor(meta.q1$SamplePoint)
+meta.q1$Run <- as.factor(meta.q1$Run)
+meta.q1$Surround <- as.factor(meta.q1$Surround)
+meta.q1$UpstreamBuild <- as.factor(meta.q1$UpstreamBuild)
+meta.q1$UpstreamFarm <- as.factor(meta.q1$UpstreamFarm)
+meta.q1$`Size(stream)` <- as.factor(meta.q1$`Size(stream)`)
+L <- nlevels(meta.q1$Lake)
+N <- ncol(asv_leg.red.q1)
+M <- nlevels(meta.q1$SamplePoint)
+# define predictors
+nseq <- colSums(otu_red)
+t <- rep(1,nrow(meta.q1))
+t[grep('18',meta.q1$SampleID)] <- 2
+t[grep('omg3',meta.q1$SampleID)] <- 3
+t[grep('omg4',meta.q1$SampleID)] <- 4
+ye <- as.numeric(meta.q1$Run)
+su <- as.numeric(meta.q1$Surround)
+bu <- as.numeric(meta.q1$UpstreamBuild)
+fa <- as.numeric(meta.q1$UpstreamFarm)
+si <- as.numeric(meta.q1$`Size(stream)`)
+pa <- as.numeric(meta.q1$UpstreamPast)+1
+# NB! Update
+si[which(is.na(si))] <- 2
+# define which random effect each sample and site is assigned to 
+level2 <- as.numeric(meta.q1$SamplePoint)
+lev3ForLev2 <- rep(1,M)
+lev3ForLev2[grep('Horn',levels(meta.q1$SamplePoint))] <- 2
+lev3ForLev2[grep('Okl',levels(meta.q1$SamplePoint))] <- 3 
+lev3ForLev2[grep('Skar',levels(meta.q1$SamplePoint))] <- 4
+lev3ForLev2[grep('Svar',levels(meta.q1$SamplePoint))] <- 5
+# outcome
+y <- asv_leg.red.q1 #t(as.matrix(colSums(asv_leg.q1),1,ncol(asv_leg.q1))) #asv_leg.red.q1
+K <- nrow(y_all)
+# save dependent variable names
+vn <- "Legionella" #rownames(asv_)
+su[which(su==3)]<-2 # only two factor levels
+si[which(si==3)] <- 2
+#data <- list(L=L,N=N,K=K,y=y_all,nseq=nseq,t=t,ye=ye,su=su,bu=bu,fa=fa,si=si,pa=pa,lake=level2) # M=M,
+data <- list(L=L,N=N,K=K,M=M,y=y_all,nseq=nseq,t=t,ye=ye,su=su,bu=bu,fa=fa,si=si,pa=pa,lev3ForLev2=lev3ForLev2,level2=level2)
+cat(sprintf("Final dimension: %d x %d\n",dim(y)[1],dim(y)[2]))
+# get sequences
+df <- as.data.frame(df)
+rownames(df) <- df$Recoded
+df[rownames(asv_leg.red.q1),1]
+```
+
+## Run Stan model 1, ASV Legionella data
+
+```{r}
+n_chains <- 7 # number of parallel chains in HMC inference
+fit6 <- sampling(
+  mod.asvs, # stan model no1
+  data=data,
+  iter = 2000, 
+  warmup = 1000,
+  chains = n_chains
+  )
+print(head(summary(fit6)$summary))
+
+spath <- "Save/"
+saveRDS(fit6, "model_asvs_legionella_step1_all_merged.rds")
+# if analysis alread saved
+fit6 <- readRDS("model_asvs_legionella_step1_all_merged.rds")
+```
+
+## Check output from Stan analysis (i.e. assess posterior statistics) for Legionella
+
+```{r posterior statistics legionella}
+aj_summary <- summary(fit6, pars = c("beta3","beta4","beta5","beta7"), probs = c(0.05, 0.95))$summary # 
+#cat(sprintf('a_j parameter (to assess effect of contamination on ASVs):\n'))
+print(aj_summary)
+
+sig_par <- find_significance(aj_summary)
+cat(sprintf('significant inferred regression coefficients (to assess effect of contamination on ASVs):\n'))
+print(sig_par)
+```
+
+
+## stan model 5 ASV data, presense/absense
+Logistic Regression, for binary outcomes, reduced model
+```{stan output.var="mod.asvs.pres"}
+data {
+
+  int L;	// number of lakes (i.e. no of 3-level groups)
+  int N;	// number of samples	
+  int K;	// number of measured outcomes
+  // outcome
+  int<lower=0, upper=1> y[K,N]; 	// abundance matrix of outcome variables, presense = 1, absense = 0
+  // predictors
+  int<lower=1, upper=4> t[N];	// timepoint or sampling round effect (t = 1,2,3,4)
+  int<lower=1, upper=2> ye[N];	// year or batch effect (0 or 1)
+  int<lower=1, upper=2> su[N]; // surrounding field/forest
+  int<lower=1, upper=2> bu[N]; // effect of buildings on outcome 
+  int<lower=1, upper=2> fa[N]; // effect of farms on outcome 
+  int<lower=1, upper=2> si[N]; // size of stream (small/medium/large)
+  int<lower=1, upper=2> pa[N]; // effect of pasture on outcome 
+  int<lower=1, upper=L> lake[N];	// lake system
+  //int<lower=1, upper=M> level2[N];	// sampling point, level 2 in hierarchy NB! Check max number of sampling points
+
+} 
+parameters {
+    
+  //vector[K] b[J]; 
+  // Group level coefficient matrix NB check dimension!
+  matrix[K,3] beta01;
+  matrix[K,1] beta02;
+  matrix[K,1] beta03;
+  matrix[K,1] beta04;
+  matrix[K,1] beta05;
+  matrix[K,1] beta06;
+  matrix[K,1] beta07;
+  matrix[K,(L-1)] beta08; // lakes
+  vector[K] bs;	// coefficient for sequence depth covariate o be used as an offset in model
+
+  // varying intercepts 
+  //vector[K] a;	// mean across sites
+  // residuals
+  //vector[K] u_j[L]; 	// lake specific residual
+  //vector[K] u_jk[M];	// lake x site residual
+
+  //real<lower=0.001> sigma_g[K]; // std dev of random intercept for lake
+  //real<lower=0.001> sigma_t[K]; // std dev of random intercept for lake x site
+
+}
+transformed parameters {
+  matrix[K,4] beta1;
+  matrix[K,2] beta2;
+  matrix[K,2] beta3;
+  matrix[K,2] beta4;
+  matrix[K,2] beta5;
+  matrix[K,2] beta6;
+  matrix[K,2] beta7;
+  matrix[K,L] beta8;
+  matrix[K,N] mu; // Individual mean for each response
+  //vector[K] a_j[L]; 	// group coefficient for intercept of each site
+  //vector[K] a_jk[M]; 	// group coefficient for intercept of each location x site
+
+  // Varying intercepts definition
+  // Level-3 (L level-3 random intercepts)
+  //for (j in 1:L) {
+  //  a_j[j] = a + u_j[j]; // lake system effect
+  //}
+  // Level-2 (M level-2 random intercepts)
+  //for (k in 1:M) {
+    //a_jk[k] = a_j[lev3ForLev2[k]] + u_jk[k]; // lake x site effect
+  //}
+  // sum-to-zero hard constraint on group level predictors
+  for (i in 1:K){
+    for (j in 1:3){
+      beta1[i,j] = beta01[i,j];
+    }
+    beta1[i,4] = -sum(beta01[i,]);
+    for (j in 1:(L-1)){
+      beta8[i,j] = beta08[i,j];
+    }
+    beta8[i,L] = -sum(beta08[i,]);  
+    beta2[i,1] = beta02[i,1];
+    beta2[i,2] = -beta02[i,1];
+    beta3[i,1] = beta03[i,1];
+    beta3[i,2] = -beta03[i,1];
+    beta4[i,1] = beta04[i,1];
+    beta4[i,2] = -beta04[i,1];
+    beta5[i,1] = beta05[i,1];
+    beta5[i,2] = -beta05[i,1];
+    beta6[i,1] = beta06[i,1];
+    beta6[i,2] = -beta06[i,1];
+    beta7[i,1] = beta07[i,1];
+    beta7[i,2] = -beta07[i,1];
+  }
+  // Individual mean at the replicate level
+  for (i in 1:K) {
+    for (j in 1:N){
+      mu[i,j] = beta1[i,t[j]] + beta2[i,ye[j]] + beta3[i,su[j]] + beta4[i,bu[j]] + beta5[i,fa[j]] + beta6[i,si[j]] + beta7[i,pa[j]] + beta8[i,lake[j]]; 
+    }
+  }
+}
+model {
+
+    
+    // prior assigned to regression coefficients
+  for (j in 1:K ){
+    for (l in 1:3)
+      beta01[j,l] ~ normal(0,10); // vague prior
+    for (l in 1:4)
+      beta08[j,l] ~ normal(0,10); // vague prior
+    beta02[j,1] ~ normal(0,10); // vague prior
+    beta03[j,1] ~ normal(0,10); // vague prior
+    beta04[j,1] ~ normal(0,10); // vague prior
+    beta05[j,1] ~ normal(0,10); // vague prior
+    beta07[j,1] ~ normal(0,10); // vague prior
+    beta06[j,1] ~ normal(0,10); // vague prior
+    
+  }
+
+  // likelihoods
+  for ( i in 1:K){
+    for ( j in 1:N ) {
+      y[i,j] ~ bernoulli_logit(mu[i,j]);
+    }
+  }
+}
+generated quantities{
+
+  int<lower=0, upper=1> y_sim[K,N];
+  int<lower=0, upper=1> y_sim_neg[K,N];
+  int<lower=0, upper=1> y_sim_pos[K,N];
+
+  for ( i in 1:K){
+    for ( j in 1:N ) {
+      y_sim[i,j] = bernoulli_rng(inv_logit(mu[i,j])); // simulating original data
+      y_sim_neg[i,j] = bernoulli_rng(inv_logit(beta1[i,t[j]] + beta2[i,ye[j]] + beta3[i,1] + beta4[i,bu[j]] + beta5[i,fa[j]] + beta6[i,si[j]] + beta7[i,pa[j]] + beta8[i,lake[j]])); // simulating data without treatment
+      y_sim_pos[i,j] = bernoulli_rng(inv_logit(beta1[i,t[j]] + beta2[i,ye[j]] + beta3[i,2] + beta4[i,bu[j]] + beta5[i,fa[j]] + beta6[i,si[j]] + beta7[i,pa[j]] + beta8[i,lake[j]])); // simulating data with treatment
+    }
+  }
+
+}
+
+```
+
+
+## Run logistic regression model
+
+```{r}
+y[y > 0] <- 1
+lake <- rep(1,nrow(meta.q1))
+lake[grep('Horn',meta.q1$SamplePoint)] <- 2
+lake[grep('Okl',meta.q1$SamplePoint)] <- 3 
+lake[grep('Skar',meta.q1$SamplePoint)] <- 4
+lake[grep('Svar',meta.q1$SamplePoint)] <- 5
+data <- list(L=L,N=N,K=K,y=y,nseq=nseq,t=t,ye=ye,su=su,bu=bu,fa=fa,si=si,pa=pa,lake=lake)
+fit7 <- sampling(
+  object = mod.asvs.pres, # stan model no1 mod.asvs.pres
+  data=data,
+  iter = 2000, 
+  warmup = 1000,
+  
+  chains = n_chains
+  )
+print(head(summary(fit7)$summary))
+
+spath <- "Save/"
+saveRDS(fit7, "model_asvs_legionella_presabs_step1_sim.rds")
+# if analysis alread saved
+fit7 <- readRDS("model_asvs_legionella_presabs_step1_sim.rds")
+```
+
+## Check output from Stan analysis (i.e. assess posterior statistics) for Legionella pres/abs
+Reduced model
+```{r posterior statistics legionella pres/abs}
+aj_summary <- summary(fit7, pars = c("beta1","beta2","beta3","beta4","beta5","beta6","beta7","beta8"), probs = c(0.025, 0.975))$summary # 
+#cat(sprintf('a_j parameter (to assess effect of contamination on ASVs):\n'))
+#print(aj_summary)
+
+sig_par <- find_significance(aj_summary)
+cat(sprintf('significant inferred regression coefficients (to assess effect of contamination on ASVs):\n'))
+print(sig_par)
+test <- as.data.frame(fit7) 
+  
+plot_difference <- function(y_sim_col2,y_sim2,asv = 'asv_5659_sim',path = 'C:/Users/joah/OneDrive - Skogforsk/Documents/Projekt/Old/Reservvatten/LandUse/Figures/',filename = 'color_val_asv5659',baseline = 'Background'){
+  
+  data1 <- data.frame(affected = t(y_sim_col2[asv,]),background = t(y_sim2[asv,]))  
+  colnames(data1) <- c("Impacted",baseline)
+  data1$Lake <- "Byasjön"
+  data1$Lake[grep('Ho',rownames(data1))] <- "Hornsjön"
+  data1$Lake[grep('Ok',rownames(data1))] <- "Oklången"
+  data1$Lake[grep('Sk',rownames(data1))] <- "Skärsjön"
+  data1$Lake[grep('Sv',rownames(data1))] <- "Svarten"
+  data1 <- data1 %>% 
+    rownames_to_column(.) %>%
+    rename(Sample = rowname)
+  data1.long <- melt(data1) %>%
+    rename(Scenario = variable,Proportion = value)
+  
+  p <- ggplot(data1.long,aes(x = Sample,y = Proportion,fill = Scenario)) +
+    geom_bar(stat="identity", color="black", position=position_dodge()) +
+    scale_fill_manual(values=c('#999999','#E69F00')) + # Use custom colors
+    theme_minimal() + 
+    theme(axis.text.x = element_blank(),strip.text.x = element_text(size = 12),axis.text.y = element_text(size = 10),legend.text = element_text(size = 10)) + 
+    facet_wrap(~Lake,scales = "free"); p 
+  ggsave(filename = paste(path,filename,"_facet.pdf",sep=""),plot = p)
+  ggsave(filename = paste(path,filename,"_facet.png",sep=""),plot = p)
+ # boxplot(Proportion~Scenario,
+#  data=data1.long,
+#  main=paste("Proportion ",asv,sep=""),
+#  xlab="Scenario",
+#  ylab="Proportion",
+#  col="steelblue",
+#  border="black"#)
+  # Change box plot colors by groups
+  p2<-ggplot(data1.long, aes(x = Scenario,y = Proportion,fill = Scenario)) +
+  geom_boxplot() +
+    scale_fill_manual(values=c('#999999','#E69F00')) + # Use custom colors
+    theme_minimal() + 
+    theme(axis.title.x = element_blank(),axis.text.x = element_text(size = 10),legend.text = element_text(size = 10),axis.text.y = element_text(size = 10))
+  ggsave(filename = paste(path,filename,"_boxplot.pdf",sep=""),plot = p2)
+  ggsave(filename = paste(path,filename,"_boxplot.png",sep=""),plot = p2)
+  
+  ttest <- t.test(Proportion ~ Scenario, data = data1.long, paired = TRUE)
+
+  return(ttest)
+}
+
+
+fix_data <- function(y_sim_freq,y){
+  
+  y_sim2 <- y
+  rownames(y_sim2) <- paste(rownames(y),"_sim",sep="")
+  y_sim2[1,] <- y_sim_freq[grep('1,',names(y_sim_freq))]
+  y_sim2[2,] <- y_sim_freq[grep('2,',names(y_sim_freq))]
+  y_sim2[3,] <- y_sim_freq[grep('3,',names(y_sim_freq))] 
+  
+  return(y_sim2)
+  
+}
+count_numbers <- function(y_sim2,y_sim_al2,thres=0.1){
+  
+  res <- y_sim_al2 - y_sim2
+  nr <- nrow(res)
+  nc <- ncol(res)
+  num <- data.frame(pos_counts = rep(0,nr),neg_counts = rep(0,nr))
+  rownames(num) <- rownames(res)
+  for (i in 1:nr){
+    num[i,1] <- length(which(res[i,] > thres))
+    num[i,2] <- length(which(res[i,] < -thres))
+    cat(sprintf('ASV name: %s\n',rownames(res)[i]))
+    cat(sprintf('Increased detection frequency: %f\n',num[i,1]/nc))
+    cat(sprintf('Decreased detection frequency: %f\n',num[i,2]/nc))
+  }
+  
+  return(num)
+}
+stat_sim <- function(y_sim_freq){
+  
+  nr <- nrow(y_sim_freq)
+  for (i in 1:nr){
+   cat(sprintf('ASV %s, average detection frequency: %f (%f)\n',rownames(y_sim_freq)[i],mean(y_sim_freq[i,]),sd(y_sim_freq[i,]))) 
+  }
+  
+}
+  
+y_sim_neg <- select(test,grep('y_sim_neg',colnames(test)))
+y_sim_pos <- select(test,grep('y_sim_pos',colnames(test)))
+y_sim <- select(test,grep('y_sim',colnames(test)))
+y_sim <- select(y_sim,-c(grep('y_sim_neg',colnames(y_sim)),grep('y_sim_pos',colnames(y_sim))))
+
+y_sim_freq  <- colSums(y_sim)/nrow(y_sim)
+y_sim_neg_freq  <- colSums(y_sim_neg)/nrow(y_sim_neg)
+y_sim_pos_freq  <- colSums(y_sim_pos)/nrow(y_sim_pos)
+
+y_sim_neg2 <- fix_data(y_sim_neg_freq,y)
+y_sim_pos2 <- fix_data(y_sim_pos_freq,y)
+y_sim2 <- fix_data(y_sim_freq,y)
+
+num_diff <- count_numbers(y_sim_neg2,y_sim_pos2)
+
+cat(sprintf('Statistic simulated detection frequency:\n'))
+stat_sim(y_sim2)
+cat(sprintf('Statistic simulated detection frequency,total absense of farms:\n'))
+stat_sim(y_sim_neg2)
+cat(sprintf('Statistic simulated detection frequency, presense of farms:\n'))
+stat_sim(y_sim_pos2)
+
+out1 <- plot_difference(y_sim_col2 = y_sim_pos2,y_sim2 = y_sim2,baseline = 'Negative',asv = 'asv_4077_sim', filename = 'farm_asv4077')
+out2 <- plot_difference(y_sim_col2 = y_sim_pos2,y_sim2 = y_sim2,baseline = 'Negative',asv = 'asv_5659_sim', filename = 'farm_asv5659')
+
+```
+
+
+## Plot results of Legionella pres/abs analysis
+
+```{r posterior plots of Legionella data analysis}
+vn <- rownames(y)
+beta.tmp <- aj_summary[grep(',2',rownames(aj_summary)),]
+beta.3 <- as.data.frame(beta.tmp[grep('beta3',rownames(beta.tmp)),])
+beta.3$Variable <- vn
+beta.3$Predictor <- "Fields"
+beta.4 <- as.data.frame(beta.tmp[grep('beta4',rownames(beta.tmp)),])
+beta.4$Variable <- vn
+beta.4$Predictor <- "Buildings"
+beta.5 <- as.data.frame(beta.tmp[grep('beta5',rownames(beta.tmp)),])
+beta.5$Variable <- vn
+beta.5$Predictor <- "Farms"
+beta.7 <- as.data.frame(beta.tmp[grep('beta7',rownames(beta.tmp)),])
+beta.7$Variable <- vn
+beta.7$Predictor <- "Pasture"
+
+
+pb3 <- plot_coef(beta.3,"Fields",ylab=0)
+pb4 <- plot_coef(beta.4,"Buildings",ylab=0)
+pb5 <- plot_coef(beta.5,"Farms",ylab=0)
+pb7 <- plot_coef(beta.7,"Pasture",ylab=0)
+beta.tot <- rbind(beta.3,beta.4,beta.5,beta.7)
+
+ggsave(filename = "C:/Users/joah/OneDrive - Skogforsk/Documents/Projekt/Old/Reservvatten/LandUse/Figures/asvs_field_effect.png", plot = pb3)
+ggsave(filename = "C:/Users/joah/OneDrive - Skogforsk/Documents/Projekt/Old/Reservvatten/LandUse/Figures/asvs_building_effect.png", plot = pb4)
+ggsave(filename = "C:/Users/joah/OneDrive - Skogforsk/Documents/Projekt/Old/Reservvatten/LandUse/Figures/asvs_farm_effect.png", plot = pb5)
+ggsave(filename = "C:/Users/joah/OneDrive - Skogforsk/Documents/Projekt/Old/Reservvatten/LandUse/Figures/asvs_pasture_effect.png", plot = pb7)
+
+########## joint figure
+#beta.tot %>% arrange(beta.tot, desc(mean)) 
+CIlow <-beta.3[,4]
+CIhigh <- beta.3[,5]
+#beta.tot %>% arrange(beta.tot, mean)
+#p <- 
+  
+  
+  beta.3 %>%
+  arrange(mean) %>%    # First sort by val. This sort the dataframe but NOT the factor levels
+  mutate(name=factor(Variable, levels=Variable)) %>%   # This trick update the factor levels
+  ggplot(aes(x=Variable,y = mean)) + geom_point(size = 0.1) + geom_pointrange(aes(ymin = CIlow,ymax = CIhigh),color = ifelse(CIlow < 0 & CIhigh > 0, "red","darkblue")) + coord_flip() + theme_bw()  + xlab("Variable") + ylab("Estimate") + geom_hline(yintercept=0,lty = 2) + 
+  theme(axis.text.y = element_blank())
+
+  CIlow <-beta.tot[,4]
+CIhigh <- beta.tot[,5]
+  p <- beta.tot %>%
+  group_by(Predictor) %>%
+  top_n(-10) %>%
+  ungroup() %>%
+  mutate(Predictor=as.factor(Predictor),
+         Variable=reorder_within(Variable,mean, Predictor)) %>%
+  ggplot(aes(x=Variable,y=mean)) +
+  geom_point(size = 0.1) +
+  geom_pointrange(aes(ymin = CIlow,ymax = CIhigh),color = ifelse(CIlow < 0 & CIhigh > 0, "red","darkblue")) +
+  facet_wrap(~Predictor, scales="free_y")+
+  coord_flip() +
+  theme_bw() +
+  xlab("Variable") +
+  ylab("Estimate") +
+  scale_x_reordered() +
+  geom_hline(yintercept=0,lty = 2) + 
+  scale_y_continuous(expand = c(0,0)) + 
+  theme(axis.text.y = element_blank()); p
+ggsave(filename = "C:/Users/joah/OneDrive - Skogforsk/Documents/Projekt/Old/Reservvatten/LandUse/Figures/asvs_joint_predictor_effect_ordered_legionella.png", plot = p)
+
+
+## adding taxonomic info ##
+tax3 <- as.data.frame(tax3)
+tax3$Variable = rownames(tax3)
+beta.tax <- merge(beta.tot,tax3,by="Variable") # merge taxonomy and coefficient estimates
+sig.beta.tax <- beta.tax %>%
+  filter(`5%` > 0 | `95%` < 0)
+
+CIlow <-sig.beta.tax[,5]
+CIhigh <- sig.beta.tax[,6]
+  p2 <- sig.beta.tax %>%
+  group_by(Predictor) %>%
+  #top_n(-10) %>%
+  ungroup() %>%
+  mutate(Predictor=as.factor(Predictor),
+         Variable=reorder_within(Variable,mean, Predictor)) %>%
+  ggplot(aes(x=Variable,y=mean,color=Order)) + # ,color=Phylum sig.beta.tax, 
+  geom_point(size = 0.1) +
+  geom_pointrange(aes(ymin = CIlow,ymax = CIhigh)) +
+  facet_wrap(~Predictor, scales="free_y")+
+  coord_flip() +
+  theme_bw() +
+  xlab("Variable") +
+  ylab("Estimate") +
+  scale_x_reordered() +
+  geom_hline(yintercept=0,lty = 2) + 
+  scale_y_continuous(expand = c(0,0)) + 
+  theme(axis.text.y = element_blank()); p2
+ggsave(filename = "C:/Users/joah/OneDrive - Skogforsk/Documents/Projekt/Old/Reservvatten/LandUse/Figures/asvs_joint_predictor_effect_significant_with_phyla_ordered.png", plot = p2)
+
+table.beta <- sig.beta.tax %>%
+  select(-c(se_mean,n_eff,Rhat)) %>%
+   group_by(Predictor) %>%
+   arrange(Predictor, desc(mean)) %>% 
+  mutate_if(is.numeric, round, digits = 2)
+write.table(table.beta,file = "C:/Users/joah/OneDrive - Skogforsk/Documents/Projekt/Old/Reservvatten/LandUse/Figures/Table_asvs_sign2.txt",quote = F,sep="\t",row.names = F)
+```
+
+## Plot distribution of Legionella
+
+```{r}
+leg_plot <- melt(log(asv_leg+0.0001)) # otu_full[rownames(asv_leg.red.q1)
+colnames(leg_plot) <- c("ASV","Sample","Abundance")
+ab_pl <- ggplot(leg_plot,aes(x = Sample,y = ASV)) +
+  geom_tile(aes(fill = Abundance)) + 
+  scale_fill_gradient(low = "white", high = "blue") + 
+  theme(axis.text = element_blank()); ab_pl
+ggsave("C:/Users/joah/OneDrive - Skogforsk/Documents/Projekt/Old/Reservvatten/LandUse/Figures/heatmap.pdf",plot = ab_pl)
+ggsave("C:/Users/joah/OneDrive - Skogforsk/Documents/Projekt/Old/Reservvatten/LandUse/Figures/heatmap.png",plot = ab_pl)
+ab_pl2 <- ggplot(leg_plot,aes(x = ASV,y = Sample)) +
+  geom_tile(aes(fill = Abundance)) + 
+  scale_fill_gradient(low = "white", high = "blue") + 
+  theme(axis.text.x = element_blank()); ab_pl2
+ggsave("C:/Users/joah/OneDrive - Skogforsk/Documents/Projekt/Old/Reservvatten/LandUse/Figures/heatmap_text2.pdf",plot = ab_pl2)
+```
+
+## Associate Legionella ASVs to chemical and environmental variables
+
+```{r}
+# step 1 pick out asvs, i.e. the outcome 
+# find missing samples
+missing <- setdiff(meta.upd$SampleID,colnames(otu_full))
+print(missing)
+# remove missing samples
+meta.upd3 <- meta.upd %>%
+  filter(!(SampleID %in% missing))
+
+y <- otu_full[rownames(asv_leg.red.q1),meta.upd3$SampleID]
+K <- nrow(y)
+N <- ncol(y)
+# step 2 set up model matrix of predictors
+
+# Logarithm product rule
+# The logarithm of the multiplication of x and y is the sum of logarithm of x and logarithm of y.
+
+# logb(x ∙ y) = logb(x) + logb(y)
+
+X <- X1 <- X2 <- meta.upd3 %>%
+  select(c(Sodium,logTurbidity,logColorVal,exppH,logTotalHardness,logAmmonium,logNitrate,logManganese,logAluminium,logCopper)) %>%
+  scale() %>%
+  as.matrix()
+M <- ncol(X)
+
+X1[,'logColorVal'] <- X1[,'logColorVal'] + log(1.5)
+X2[,'logAluminium'] <- X2[,'logAluminium'] + log(1.5) 
+
+# define other design predictors
+t <- rep(1,nrow(meta.upd3)) # NB no chemical data sampled on the second round of sampling!
+t[grep('omg3',meta.upd3$SampleID)] <- 2
+t[grep('omg4',meta.upd3$SampleID)] <- 3
+ye <- as.numeric(as.factor(meta.upd3$Run))
+lake <- as.numeric(as.factor(meta.upd3$Lake))
+L <- max(lake)
+y[y > 0] <- 1 # presense absense data
+# add 50% increase in color value and aluminium data for simulating new observations
+#Xup <- meta.upd3 %>%
+#  select(c(logColorVal,logAluminium))
+
+data <- list(L=L,N=N,K=K,M=M,y=y,t=t,ye=ye,X = X, X1 = X1, X2 = X2, lake=lake)
+```
+
+## stan model 6 ASV data, presense/absense
+Logistic Regression, for binary outcomes, modelling associations to chemical and env variables
+```{stan output.var="mod.asvs.pres2"}
+data {
+
+  int L;	// number of lakes (i.e. no of 3-level groups)
+  int N;	// number of samples	
+  int K;	// number of measured outcomes
+  int M;  // number of covariates in model
+  // outcome
+  int<lower=0, upper=1> y[K,N]; 	// abundance matrix of outcome variables, presense = 1, absense = 0
+  // predictors
+  int<lower=1, upper=3> t[N];	// timepoint or sampling round effect (t = 1,2,3)
+  int<lower=1, upper=2> ye[N];	// year or batch effect (0 or 1)
+  matrix[N,M] X; //the model matrix with predictors, scaled to unit variance, zero mean
+  matrix[N,M] X1; //the model matrix with predictors, added with extra increase in color value abundance, scaled to unit variance, zero mean
+  matrix[N,M] X2; //the model matrix with predictors, added with extra increase in aluminium abundance, scaled to unit variance, zero mean  
+  int<lower=1, upper=L> lake[N];	// lake system
+  //int<lower=1, upper=M> level2[N];	// sampling point, level 2 in hierarchy NB! Check max number of sampling points
+
+} 
+parameters {
+    
+  //vector[K] b[J]; 
+  // Group level coefficient matrix NB check dimension!
+  matrix[K,2] beta01; // timepoint
+  matrix[K,1] beta02;  // batch
+  matrix[K,(L-1)] beta03; // lakes
+  matrix[M,K] beta; // covariates
+
+  // varying intercepts 
+  //vector[K] a;	// mean across sites
+  // residuals
+  //vector[K] u_j[L]; 	// lake specific residual
+  //vector[K] u_jk[M];	// lake x site residual
+
+  //real<lower=0.001> sigma_g[K]; // std dev of random intercept for lake
+  //real<lower=0.001> sigma_t[K]; // std dev of random intercept for lake x site
+
+}
+transformed parameters {
+  matrix[K,3] beta1;
+  matrix[K,2] beta2;
+  matrix[K,L] beta3;
+  matrix[K,N] mu; // Individual mean for each response
+  //vector[K] a_j[L]; 	// group coefficient for intercept of each site
+  //vector[K] a_jk[M]; 	// group coefficient for intercept of each location x site
+
+  // Varying intercepts definition
+  // Level-3 (L level-3 random intercepts)
+  //for (j in 1:L) {
+  //  a_j[j] = a + u_j[j]; // lake system effect
+  //}
+  // Level-2 (M level-2 random intercepts)
+  //for (k in 1:M) {
+    //a_jk[k] = a_j[lev3ForLev2[k]] + u_jk[k]; // lake x site effect
+  //}
+  // sum-to-zero hard constraint on group level predictors
+  for (i in 1:K){
+    for (j in 1:2){
+      beta1[i,j] = beta01[i,j];
+    }
+    beta1[i,3] = -sum(beta01[i,]);
+    for (j in 1:(L-1)){
+      beta3[i,j] = beta03[i,j];
+    }
+    beta3[i,L] = -sum(beta03[i,]);  
+    beta2[i,1] = beta02[i,1];
+    beta2[i,2] = -beta02[i,1];
+  }
+  // Individual mean at the replicate level
+  for (i in 1:K) {
+    for (j in 1:N){
+      mu[i,j] = beta1[i,t[j]] + beta2[i,ye[j]] + beta3[i,lake[j]] + X[j,] * beta[,i]; // NB check dim 
+    }
+  }
+}
+model {
+
+    
+    // prior assigned to regression coefficients
+  for (j in 1:K ){
+    for (l in 1:2)
+      beta01[j,l] ~ normal(0,10); // vague prior
+    beta02[j,1] ~ normal(0,10); // vague prior
+    for (l in 1:(L-1))
+      beta03[j,l] ~ normal(0,10); // vague prior
+    for (l in 1:M)
+      beta[l,j] ~ normal(0,10); // vague prior
+  }
+
+  // likelihoods
+  for ( i in 1:K){
+    for ( j in 1:N ) {
+      y[i,j] ~ bernoulli_logit(mu[i,j]);
+    }
+  }
+}
+generated quantities {
+  
+  int<lower=0, upper=1> y_sim[K,N]; // simulated observations, conditioned on input data
+  int<lower=0, upper=1> y_sim_col[K,N]; // simulated observations with 50% increase in Color value
+  int<lower=0, upper=1> y_sim_al[K,N]; // simulated observations with 50% increase in Aluminium
+  
+  for ( i in 1:K){
+    for(j in 1:N) {
+      y_sim[i,j]= bernoulli_rng(inv_logit(mu[i,j]));
+      y_sim_col[i,j] = bernoulli_rng(inv_logit(beta1[i,t[j]] + beta2[i,ye[j]] + beta3[i,lake[j]] + X1[j,] * beta[,i]));
+      y_sim_al[i,j] = bernoulli_rng(inv_logit(beta1[i,t[j]] + beta2[i,ye[j]] + beta3[i,lake[j]] + X2[j,] * beta[,i]));
+    }
+  }
+  
+
+}
+
+```
+
+## Run logistic regression model on chemical and Legionella data
+
+
+```{r}
+fit8 <- sampling(
+  mod.asvs.pres2, # stan model presens/absens
+  data=data,
+  iter = 2000, 
+  warmup = 1000,
+  
+  chains = n_chains
+  )
+print(head(summary(fit8)$summary))
+
+spath <- "Save/"
+saveRDS(fit8, "model_asvs_legionella_presabs_step2_sim_50inc.rds")
+# if analysis alread saved
+fit8 <- readRDS("model_asvs_legionella_presabs_step2_sim_50inc.rds")
+```
+
+## Check output from Stan analysis (i.e. assess posterior statistics) for Legionella pres/abs
+Reduced model, chemical data
+```{r posterior statistics legionella pres/abs for chemical data}
+aj_summary <- summary(fit8, pars = c("beta1","beta2","beta3","beta"), probs = c(0.025, 0.975))$summary # 
+#cat(sprintf('a_j parameter (to assess effect of contamination on ASVs):\n'))
+#print(aj_summary)
+
+sig_par <- find_significance(aj_summary)
+cat(sprintf('significant inferred regression coefficients (to assess effect of contamination on ASVs):\n'))
+print(sig_par)
+aj_summary2<- summary(fit8, pars = c("beta1","beta2","beta3","beta"), probs = c(0.05, 0.95))$summary # 
+sig_par2 <- find_significance(aj_summary2)
+cat(sprintf('significant inferred regression coefficients (to assess effect of contamination on ASVs) at alpha  = 0.10 level:\n'))
+print(sig_par2)
+```
+
+## Check posterior predictive simulations
+
+```{r}
+fix_data <- function(y_sim_freq,y){
+  
+  y_sim2 <- y
+  rownames(y_sim2) <- paste(rownames(y),"_sim",sep="")
+  y_sim2[1,] <- y_sim_freq[grep('1,',names(y_sim_freq))]
+  y_sim2[2,] <- y_sim_freq[grep('2,',names(y_sim_freq))]
+  y_sim2[3,] <- y_sim_freq[grep('3,',names(y_sim_freq))] 
+  
+  return(y_sim2)
+  
+}
+count_numbers <- function(y_sim2,y_sim_al2,thres=0.1){
+  
+  res <- y_sim_al2 - y_sim2
+  nr <- nrow(res)
+  nc <- ncol(res)
+  num <- data.frame(pos_counts = rep(0,nr),neg_counts = rep(0,nr))
+  rownames(num) <- rownames(res)
+  for (i in 1:nr){
+    num[i,1] <- length(which(res[i,] > thres))
+    num[i,2] <- length(which(res[i,] < -thres))
+    cat(sprintf('ASV name: %s\n',rownames(res)[i]))
+    cat(sprintf('Increased detection frequency: %f\n',num[i,1]/nc))
+    cat(sprintf('Decreased detection frequency: %f\n',num[i,2]/nc))
+  }
+  
+  return(num)
+}
+stat_sim <- function(y_sim_freq){
+  
+  nr <- nrow(y_sim_freq)
+  for (i in 1:nr){
+   cat(sprintf('ASV %s, average detection frequency: %f (%f)\n',rownames(y_sim_freq)[i],mean(y_sim_freq[i,]),sd(y_sim_freq[i,]))) 
+  }
+  
+}
+
+test <- as.data.frame(fit8) 
+  
+y_sim_al <- select(test,grep('y_sim_al',colnames(test)))
+y_sim_col <- select(test,grep('y_sim_col',colnames(test)))
+y_sim <- select(test,grep('y_sim',colnames(test)))
+y_sim <- select(y_sim,-c(grep('y_sim_al',colnames(y_sim)),grep('y_sim_col',colnames(y_sim))))
+
+y_sim_freq  <- colSums(y_sim)/nrow(y_sim)
+y_sim_al_freq  <- colSums(y_sim_al)/nrow(y_sim_al)
+y_sim_col_freq  <- colSums(y_sim_col)/nrow(y_sim_col)
+
+y_sim_al2 <- fix_data(y_sim_al_freq,y)
+y_sim_col2 <- fix_data(y_sim_col_freq,y)
+y_sim2 <- fix_data(y_sim_freq,y)
+
+
+#rbind(y,y_sim2)
+num_al <- count_numbers(y_sim2,y_sim_al2)
+num_col <- count_numbers(y_sim2,y_sim_col2)
+
+cat(sprintf('Statistic simulated detection frequency:\n'))
+stat_sim(y_sim2)
+cat(sprintf('Statistic simulated detection frequency,increased aluminium abundance:\n'))
+stat_sim(y_sim_al2)
+cat(sprintf('Statistic simulated detection frequency,increased color value abundance:\n'))
+stat_sim(y_sim_col2)
+
+out1 <- plot_difference(y_sim_col2 = y_sim_col2,y_sim2 = y_sim2)
+out2 <- plot_difference(y_sim_col2 = y_sim_al2,y_sim2 = y_sim2,asv = 'asv_4077_sim', filename = 'al_asv4077')
+```
+
+## Check Legionella presence in inflows and lakes
+
+```{r}
+#asv_leg # All ASVs assigned as Legionella at the genus level
+# add columns
+metadata <- meta %>%
+  mutate(Env= if_else(.$Type == "Point", 'Inflow', 'Lake'))
+# merge data frames
+data.leg <- data.frame(t(asv_leg[order(rownames(asv_leg)),]),Env = metadata$Env[order(metadata$SampleID)]) 
+data.leg <- data.leg %>%
+  mutate(across(Env,as.factor))
+# Filter ASV data
+# step 1 check all data
+group.leg <- aggregate(data.leg[,1:584], list(data.leg$Env), FUN=sum)
+which(group.leg["Inflow",] > 0)
+cat(sprintf('Number of Legionella ASVs only present in inflows: %i\n',length(which(group.leg[1,]!=0 & group.leg[2,] ==0))))
+cat(sprintf('Number of Legionella ASVs only present in lakes: %i\n',length(which(group.leg[2,]!=0 & group.leg[1,] ==0))))
+#data.leg %>% 
+#  mutate()
+#  sum(colSums(.))
+# step 2 check top 3 ASVs
+asv_leg_pres <- asv_leg
+asv_leg_pres[asv_leg > 0] <- 1 # convert to presence / absence data
+# merge data frames
+data.leg.pres <- data.frame(t(asv_leg_pres[order(rownames(asv_leg_pres)),]),Env = metadata$Env[order(metadata$SampleID)]) 
+data.leg.pres <- data.leg.pres %>%
+  mutate(across(Env,as.factor))
+cat(sprintf('asv_2280\n'))
+data.leg.pres %>%
+  group_by(Env) %>%
+  summarize(
+    count = n(),
+    mean = mean(asv_2280, na.rm = TRUE),
+    sd = sd(asv_2280, na.rm = TRUE)
+  )
+cat(sprintf('asv_4077\n'))
+data.leg.pres %>%
+  group_by(Env) %>%
+  summarize(
+    count = n(),
+    mean = mean(asv_4077, na.rm = TRUE),
+    sd = sd(asv_4077, na.rm = TRUE)
+  )
+cat(sprintf('asv_5659\n'))
+data.leg.pres %>%
+  group_by(Env) %>%
+  summarize(
+    count = n(),
+    mean = mean(asv_5659, na.rm = TRUE),
+    sd = sd(asv_5659, na.rm = TRUE)
+  )
+
+```
+
